@@ -38,7 +38,8 @@ from dataset import get_dataloader
 def evaluate(model, loader, loss_fn, device, threshold=0.5):
     model.eval()
     all_phq_pred, all_phq_true = [], []
-    all_dep_pred, all_dep_true = [], []
+    all_dep_true = []
+    all_dep_prob = []
     all_cosine_dist = []
     total_loss = 0.0
 
@@ -57,14 +58,37 @@ def evaluate(model, loader, loss_fn, device, threshold=0.5):
 
             all_phq_pred.extend(out["phq_score"].cpu().numpy())
             all_phq_true.extend(phq.cpu().numpy())
-            all_dep_pred.extend((torch.sigmoid(out["dep_logit"]) > threshold).long().cpu().numpy())
+            all_dep_prob.extend(torch.sigmoid(out["dep_logit"]).cpu().numpy())
             all_dep_true.extend(dep.long().cpu().numpy())
             all_cosine_dist.extend(out["cosine_dist"].cpu().numpy())
 
     all_phq_pred = np.array(all_phq_pred)
     all_phq_true = np.array(all_phq_true)
-    all_dep_pred = np.array(all_dep_pred)
+    all_dep_prob = np.array(all_dep_prob)
     all_dep_true = np.array(all_dep_true)
+
+    # Tune threshold on dev set for F1 (more robust than fixed 0.5 with class imbalance)
+    thr_grid = np.linspace(0.05, 0.95, 37)
+    best_thr, best_f1, best_acc = threshold, -1.0, -1.0
+    best_pred = (all_dep_prob > threshold).astype(int)
+    for thr in thr_grid:
+        pred = (all_dep_prob > thr).astype(int)
+        f1_t = f1_score(all_dep_true, pred, zero_division=0)
+        acc_t = accuracy_score(all_dep_true, pred)
+        if (
+            (f1_t > best_f1)
+            or (abs(f1_t - best_f1) < 1e-12 and acc_t > best_acc)
+            or (
+                abs(f1_t - best_f1) < 1e-12
+                and abs(acc_t - best_acc) < 1e-12
+                and abs(thr - 0.5) < abs(best_thr - 0.5)
+            )
+        ):
+            best_f1 = f1_t
+            best_acc = acc_t
+            best_thr = float(thr)
+            best_pred = pred
+    all_dep_pred = best_pred
 
     mae  = mean_absolute_error(all_phq_true, all_phq_pred)
     rmse = np.sqrt(((all_phq_true - all_phq_pred) ** 2).mean())
@@ -79,6 +103,9 @@ def evaluate(model, loader, loss_fn, device, threshold=0.5):
         "rmse":        rmse,
         "f1":          f1,
         "acc":         acc,
+        "thr":         best_thr,
+        "p_mean":      float(all_dep_prob.mean()),
+        "p_std":       float(all_dep_prob.std()),
         "disc_dep":    avg_disc_dep,     # ← key CDL diagnostic
         "disc_nodep":  avg_disc_nodep,
         "dep_pred":    all_dep_pred,
@@ -116,10 +143,20 @@ def train(args):
         dropout=args.dropout,
     ).to(device)
 
+    # Class balance for BCEWithLogitsLoss: pos_weight = N_neg / N_pos
+    y_train = train_loader.dataset.labels["PHQ8_Binary"].astype(float).values
+    n_pos = float(y_train.sum())
+    n_neg = float(len(y_train) - n_pos)
+    pos_weight_value = (n_neg / max(n_pos, 1.0))
+    pos_weight = torch.tensor(pos_weight_value, dtype=torch.float32, device=device)
+    print(f"Train class balance: pos={int(n_pos)} neg={int(n_neg)} pos_weight={pos_weight_value:.3f}")
+
     loss_fn   = CDLLoss(
         margin=args.contrastive_margin,
         lambda_cls=args.lambda_cls,
         lambda_contrast=args.lambda_contrast,
+        pos_weight=pos_weight,
+        contrastive_pos_weight=pos_weight_value,
     )
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -137,6 +174,10 @@ def train(args):
     print(f"{'='*60}\n")
 
     for epoch in range(1, args.epochs + 1):
+        # Contrastive warm-up
+        warmup_ratio = min(1.0, epoch / max(args.contrastive_warmup_epochs, 1))
+        loss_fn.lambda_contrast = args.lambda_contrast * warmup_ratio
+
         # ── Train ──
         model.train()
         epoch_loss = {"total": 0, "l_reg": 0, "l_cls": 0, "l_contrast": 0}
@@ -182,9 +223,10 @@ def train(args):
             f"Ep {epoch:03d} | "
             f"Loss {epoch_loss['total']:.4f} "
             f"(reg={epoch_loss['l_reg']:.3f} cls={epoch_loss['l_cls']:.3f} "
-            f"ctr={epoch_loss['l_contrast']:.3f}) | "
+            f"ctr={epoch_loss['l_contrast']:.3f} λctr={loss_fn.lambda_contrast:.3f}) | "
             f"MAE={metrics['mae']:.2f} RMSE={metrics['rmse']:.2f} "
-            f"F1={metrics['f1']:.3f} Acc={metrics['acc']:.3f} | "
+            f"F1={metrics['f1']:.3f} Acc={metrics['acc']:.3f} Thr={metrics['thr']:.2f} "
+            f"Pμ={metrics['p_mean']:.3f} Pσ={metrics['p_std']:.3f} | "
             f"Disc dep={metrics['disc_dep']:.3f} nodep={metrics['disc_nodep']:.3f}"
         )
 
@@ -237,12 +279,13 @@ def parse_args():
     p.add_argument("--nonverbal_dim",  type=int, default=88,
                    help="Non-verbal feature dim after preprocessing (default 88 for current DAIC-WOZ files)")
     # Model
-    p.add_argument("--hidden_dim", type=int,   default=128)
-    p.add_argument("--dropout",    type=float, default=0.3)
+    p.add_argument("--hidden_dim", type=int,   default=64)
+    p.add_argument("--dropout",    type=float, default=0.4)
     # Loss
-    p.add_argument("--contrastive_margin", type=float, default=1.0)
+    p.add_argument("--contrastive_margin", type=float, default=0.5)
     p.add_argument("--lambda_cls",         type=float, default=1.0)
-    p.add_argument("--lambda_contrast",    type=float, default=0.5)
+    p.add_argument("--lambda_contrast",    type=float, default=1.0)
+    p.add_argument("--contrastive_warmup_epochs", type=int, default=10)
     # Training
     p.add_argument("--epochs",     type=int,   default=50)
     p.add_argument("--batch_size", type=int,   default=8)

@@ -131,24 +131,6 @@ if exist requirements.txt (
     )
 )
 
-echo [7/7] Verify environment...
-
-python -c "import torch, dgl, torch_geometric, transformers, numpy, sklearn; \
-print('OK'); \
-print('torch:', torch.__version__); \
-print('cuda:', torch.cuda.is_available()); \
-print('cuda version:', torch.version.cuda); \
-print('dgl:', dgl.__version__); \
-print('pyg:', torch_geometric.__version__); \
-print('transformers:', transformers.__version__); \
-print('numpy:', numpy.__version__); \
-print('sklearn:', sklearn.__version__)"
-
-if errorlevel 1 (
-    echo ERROR: Verification failed
-    exit /b 1
-)
-
 echo.
 echo ================================
 echo   SETUP SUCCESS

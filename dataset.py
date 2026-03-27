@@ -13,8 +13,8 @@ Data structure (flat, NOT in {ID}_P/ folders):
 
 Features:
 - Text: 768-dim BERT embeddings (per turn)
-- Non-verbal: 17 AUs + 88 COVAREP = 105 dimensions
-- Output: 105-dim non-verbal feature sequences
+- Non-verbal: AU_r + COVAREP (participant-dependent; 300 gives 14 + 74 = 88)
+- Output: fixed `nonverbal_dim` after pad/truncate (default 88)
 
 No synthetic data. All real data only.
 """
@@ -118,7 +118,7 @@ class DAICWOZDataset(Dataset):
                         Participant_ID, PHQ8_Score, PHQ8_Binary
         data_root:      Root directory containing participant data files
         text_feat_dim:  Dimension of text features (768 for BERT)
-        nonverbal_dim:  Dimension of non-verbal features (105 = 17 AUs + 88 COVAREP)
+        nonverbal_dim:  Target dimension for non-verbal features after pad/truncate
         max_text_len:   Max # text turns to keep
         max_nv_len:     Max # non-verbal frames to keep
     """
