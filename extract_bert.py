@@ -26,6 +26,30 @@ import torch
 from transformers import AutoTokenizer, AutoModel
 
 
+def get_hf_token(cli_token=None, env_file=".env"):
+    """Resolve HF token from CLI > environment > .env file."""
+    if cli_token:
+        return cli_token
+
+    token = os.getenv("HF_TOKEN")
+    if token:
+        return token
+
+    if os.path.exists(env_file):
+        with open(env_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() == "HF_TOKEN":
+                    token = v.strip().strip('"').strip("'")
+                    if token:
+                        os.environ["HF_TOKEN"] = token
+                        return token
+    return None
+
+
 def mean_pool(token_embeddings, attention_mask):
     """Mean pooling over non-padding tokens."""
     mask = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
@@ -86,8 +110,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data_root",  default="data/daicwoz/")
     p.add_argument("--split_csv",  required=True, help="Train or dev CSV with Participant_ID")
-    p.add_argument("--model_name", default="bert-base-uncased",
+    p.add_argument("--model_name", default="mental/mental-bert-base-uncased",
                    help="HuggingFace model. 'mental/mental-bert-base-uncased' recommended for clinical text")
+    p.add_argument("--hf_token",   default=None,
+                   help="Hugging Face token (optional). If omitted, use HF_TOKEN from env/.env")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--max_len",    type=int, default=128)
     args = p.parse_args()
@@ -95,8 +121,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Loading model: {args.model_name} on {device}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model     = AutoModel.from_pretrained(args.model_name).to(device)
+    hf_token = get_hf_token(args.hf_token)
+    if hf_token:
+        print("Using authenticated Hugging Face access.")
+    else:
+        print("No HF token found. Trying anonymous access.")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, token=hf_token)
+    model     = AutoModel.from_pretrained(args.model_name, token=hf_token).to(device)
 
     df = pd.read_csv(args.split_csv)
     df.columns = [c.strip() for c in df.columns]
@@ -106,9 +138,9 @@ def main():
         transcript  = os.path.join(args.data_root, f"{pid}_TRANSCRIPT.csv")
         out_path    = os.path.join(args.data_root, f"{pid}_text_feats.npy")
 
-        if os.path.exists(out_path):
-            print(f"  [SKIP] {pid} — already extracted")
-            continue
+        # if os.path.exists(out_path):
+        #     print(f"  [SKIP] {pid} — already extracted")
+        #     continue
 
         if not os.path.exists(transcript):
             print(f"  [MISS] {pid} — transcript not found: {transcript}")
