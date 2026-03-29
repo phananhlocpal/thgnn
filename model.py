@@ -1,981 +1,725 @@
 """
-HTDG-CDL: Heterogeneous Temporal Discrepancy Graph for
-Contrastive Discrepancy Learning in Depression Detection
+model.py
 
-Core Mathematical Framework:
-─────────────────────────────────────────────────────────────────
-1. HTDG (Heterogeneous Temporal Discrepancy Graph):
-   G = (V, E, τ_V, τ_E) where τ_V ∈ {text, audio, facial}
-   and τ_E ∈ {temporal, cross-modal-consistent, cross-modal-discrepant}
+HMSG-Net: Heterogeneous Multi-modal Symptom-Guided Graph Network
+================================================================
 
-   INNOVATION: The graph topology ENCODES discrepancy as structure.
-   Discrepancy edge weight: w_ij = 1 - σ(cos_sim(h_i, h_j))
-   This makes "incongruence" a first-class geometric property.
-
-2. Heterogeneous Graph Attention with Edge Features (HGA-EF):
-   α_ij^(τ) = softmax_j [ (W_q^τ h_i)^T (W_k^τ h_j) / √d
-                           + φ_τ(e_ij)^T r_τ ]
-   where φ_τ(e_ij) encodes (edge_type, discrepancy_weight, temporal_distance)
-   
-   Message passing:
-   h_v^(l+1) = σ( LayerNorm( Σ_{τ∈R} W_o^τ · Σ_{u∈N_τ(v)} α_vu^(τ) · W_v^τ h_u^(l) ) )
-
-3. Spectral Discrepancy Signal (SDS):
-   Build discrepancy Laplacian: L_disc = D_disc - A_disc
-   where A_disc[i,j] = w_ij (cross-modal discrepancy weight)
-   
-   Project features onto top-k high-frequency eigenvectors:
-   z_spectral = U_k^T h  (k eigenvectors with largest eigenvalues)
-   
-   Biological basis: depression → abnormal HIGH-frequency patterns
-   in facial/acoustic sequences (flat affect, psychomotor retardation).
-
-4. Hyperbolic Manifold Embedding (Poincaré Ball):
-   Map fused features to Poincaré ball B^n_c = {x ∈ ℝ^n : c||x|| < 1}
-   
-   Exponential map: Exp_x^c(v) = x ⊕_c tanh(√c · λ_x^c · ||v||/2) · v/(√c||v||)
-   Möbius addition: x ⊕_c y = ((1+2c<x,y>+c||y||²)x + (1-c||x||²)y) / (1+2c<x,y>+c²||x||²||y||²)
-   
-   Poincaré distance: d_c(x,y) = (2/√c) · artanh(√c · ||-x ⊕_c y||)
-   
-   Depression severity forms a HIERARCHY in hyperbolic space:
-   center (c=0) → mild → moderate → severe (near boundary)
-
-5. Riemannian Manifold Contrastive Loss (RMC):
-   L_RMC = Σ_i log [ exp(-d_c(z_i, z_i+)/τ) / Σ_j exp(-d_c(z_i, z_j)/τ) ]
-   where d_c = Poincaré distance (geodesic on curved manifold)
-   
-   Combined loss:
-   L = L_MSE(PHQ) + λ_cls · L_BCE(dep) + λ_rmc · L_RMC + λ_reg · ||θ||²
-
-6. Hyperbolic Mixup (data scarcity augmentation):
-   z_mix = Exp_0^c( λ · Log_0^c(z_i) + (1-λ) · Log_0^c(z_j) )
-   y_mix = λ · y_i + (1-λ) · y_j
-   
-   Valid interpolation on the Poincaré manifold — generates
-   semantically meaningful synthetic samples along depression continuum.
-─────────────────────────────────────────────────────────────────
+Key components
+--------------
+FocalLoss          – handles severe class imbalance
+SymptomRoutedRGAT  – the novel SR-RGAT layer
+HMSGNet            – full model (encoder → SR-RGAT × 3 → readout → fusion → heads)
+compute_loss       – combines focal + BCE + SmoothL1
 """
 
 import math
+from typing import List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import MessagePassing
-from torch_geometric.utils import softmax as pyg_softmax
+from torch import Tensor
+from torch_scatter import scatter_add, scatter_softmax
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Architecture hyper-parameters (can be overridden when constructing HMSGNet)
+# ─────────────────────────────────────────────────────────────────────────────
+
+TEXT_DIM   = 768
+AUDIO_DIM  = 46
+VIDEO_DIM  = 98
+UNIFIED_DIM = TEXT_DIM + AUDIO_DIM + VIDEO_DIM  # 912
+
+NUM_EDGE_TYPES = 9
+NUM_NODE_TYPES = 3
+NUM_SYMPTOMS   = 8   # PHQ-8 items
+
+HIDDEN_DIM   = 256
+NUM_GNN_LAYERS = 3
+DROPOUT      = 0.35
 
 
-# ═══════════════════════════════════════════════════════════════
-# SECTION 1: Hyperbolic Geometry Operations (Poincaré Ball)
-# ═══════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# Focal Loss
+# ─────────────────────────────────────────────────────────────────────────────
 
-class PoincareBall(nn.Module):
+class FocalLoss(nn.Module):
     """
-    Poincaré Ball model of hyperbolic space with curvature c.
-    
-    All operations are numerically stabilized for deep learning.
-    
-    Mathematical reference:
-      Ganea et al. (2018) "Hyperbolic Neural Networks"
-      Chami et al. (2019) "Hyperbolic Graph Convolutional Neural Networks"
+    Binary Focal Loss.
+
+    Parameters
+    ----------
+    alpha : float
+        Balancing factor for the positive class (set < 0.5 to down-weight
+        the majority negative class).  Default 0.75 (down-weight negatives).
+    gamma : float
+        Focusing exponent. Default 2.0.
+    reduction : str
+        'mean' | 'sum' | 'none'.
     """
-    def __init__(self, c: float = 1.0, eps: float = 1e-5):
-        super().__init__()
-        # Learnable curvature (allows model to discover optimal geometry)
-        self.c = nn.Parameter(torch.tensor(c))
-        self.eps = eps
 
-    def _clip(self, x):
-        """Project x inside the open ball: ||x|| < 1/√c"""
-        c = self.c.abs().clamp(min=1e-8)
-        norm = x.norm(dim=-1, keepdim=True).clamp(min=self.eps)
-        max_norm = (1.0 - self.eps) / (c.sqrt())
-        return x * torch.where(norm > max_norm, max_norm / norm, torch.ones_like(norm))
-
-    def mobius_add(self, x, y):
-        """
-        Möbius addition: x ⊕_c y
-        = ((1 + 2c<x,y> + c||y||²)x + (1 - c||x||²)y)
-          / (1 + 2c<x,y> + c²||x||²||y||²)
-        """
-        c = self.c.abs().clamp(min=1e-8)
-        x2 = (x * x).sum(dim=-1, keepdim=True)
-        y2 = (y * y).sum(dim=-1, keepdim=True)
-        xy = (x * y).sum(dim=-1, keepdim=True)
-        
-        num_x = (1 + 2 * c * xy + c * y2) * x
-        num_y = (1 - c * x2) * y
-        denom = (1 + 2 * c * xy + c * c * x2 * y2).clamp(min=self.eps)
-        
-        return self._clip((num_x + num_y) / denom)
-
-    def exp_map_zero(self, v):
-        """
-        Exponential map at origin: Exp_0^c(v)
-        = tanh(√c · ||v||) · v / (√c · ||v||)
-        Maps tangent vectors to Poincaré ball.
-        """
-        c = self.c.abs().clamp(min=1e-8)
-        v_norm = v.norm(dim=-1, keepdim=True).clamp(min=self.eps)
-        sqrt_c = c.sqrt()
-        return self._clip(torch.tanh(sqrt_c * v_norm) * v / (sqrt_c * v_norm))
-
-    def log_map_zero(self, y):
-        """
-        Logarithmic map at origin: Log_0^c(y)
-        = artanh(√c · ||y||) · y / (√c · ||y||)
-        Maps Poincaré ball back to tangent space.
-        """
-        c = self.c.abs().clamp(min=1e-8)
-        y_norm = y.norm(dim=-1, keepdim=True).clamp(min=self.eps)
-        sqrt_c = c.sqrt()
-        return torch.atanh((sqrt_c * y_norm).clamp(-1 + self.eps, 1 - self.eps)) * y / (sqrt_c * y_norm)
-
-    def distance(self, x, y):
-        """
-        Poincaré distance: d_c(x,y) = (2/√c) · artanh(√c · ||-x ⊕_c y||)
-        """
-        c = self.c.abs().clamp(min=1e-8)
-        neg_x = -x
-        diff = self.mobius_add(neg_x, y)
-        diff_norm = diff.norm(dim=-1).clamp(min=self.eps)
-        sqrt_c = c.sqrt()
-        return (2.0 / sqrt_c) * torch.atanh((sqrt_c * diff_norm).clamp(-1 + self.eps, 1 - self.eps))
-
-    def hyperbolic_linear(self, x, W, b=None):
-        """
-        Hyperbolic linear map via:
-        1. Log_0(x) → tangent space
-        2. Apply linear W
-        3. Exp_0 → back to manifold
-        """
-        tan_x = self.log_map_zero(x)
-        out = tan_x @ W.t()
-        if b is not None:
-            out = out + b
-        return self.exp_map_zero(out)
-
-    def hyperbolic_mixup(self, z_i, z_j, lam):
-        """
-        Geodesic interpolation on Poincaré ball (valid hyperbolic mixup):
-        z_mix = Exp_0(λ · Log_0(z_i) + (1-λ) · Log_0(z_j))
-        
-        Unlike Euclidean mixup, this stays ON the manifold.
-        """
-        tan_i = self.log_map_zero(z_i)
-        tan_j = self.log_map_zero(z_j)
-        tan_mix = lam * tan_i + (1 - lam) * tan_j
-        return self.exp_map_zero(tan_mix)
-
-
-# ═══════════════════════════════════════════════════════════════
-# SECTION 2: Heterogeneous Graph Attention with Edge Features
-# ═══════════════════════════════════════════════════════════════
-
-class HGAEdgeConv(MessagePassing):
-    """
-    Heterogeneous Graph Attention with Edge Features (HGA-EF).
-    
-    For a relation type τ:
-    α_ij^(τ) = softmax_j [ (W_q h_i)^T (W_k h_j) / √d_k + φ(e_ij)^T r ]
-    
-    where φ(e_ij) ∈ ℝ^d encodes:
-      - edge_type ∈ {temporal, cross-modal-consistent, cross-modal-discrepant}
-      - discrepancy_weight w_ij = 1 - σ(cos_sim(h_i, h_j))
-      - temporal_distance |t_i - t_j|
-    
-    This allows the model to LEARN different behaviors for
-    consistent vs discrepant cross-modal edges.
-    """
-    def __init__(self, in_dim: int, out_dim: int, n_heads: int = 4,
-                 edge_dim: int = 16, dropout: float = 0.1):
-        super().__init__(aggr='add', node_dim=0)
-        self.in_dim   = in_dim
-        self.out_dim  = out_dim
-        self.n_heads  = n_heads
-        self.head_dim = out_dim // n_heads
-        self.edge_dim = edge_dim
-        self.scale    = math.sqrt(self.head_dim)
-
-        # Query / Key / Value projections (per head)
-        self.W_q = nn.Linear(in_dim, out_dim, bias=False)
-        self.W_k = nn.Linear(in_dim, out_dim, bias=False)
-        self.W_v = nn.Linear(in_dim, out_dim, bias=False)
-
-        # Edge feature projection → attention bias
-        self.edge_proj = nn.Sequential(
-            nn.Linear(edge_dim, out_dim),
-            nn.SiLU(),
-            nn.Linear(out_dim, n_heads),
-        )
-
-        # Output projection
-        self.W_o = nn.Linear(out_dim, out_dim)
-        self.norm = nn.LayerNorm(out_dim)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x, edge_index, edge_attr):
-        """
-        x:          (N, in_dim)
-        edge_index: (2, E)
-        edge_attr:  (E, edge_dim)
-        """
-        return self.norm(x + self.propagate(edge_index, x=x, edge_attr=edge_attr))
-
-    def message(self, x_i, x_j, edge_attr, index):
-        """
-        Compute attention-weighted message for each edge.
-        x_i, x_j: (E, in_dim) — target/source node features
-        edge_attr: (E, edge_dim)
-        """
-        B = x_i.size(0)
-
-        # Multi-head projections → (E, n_heads, head_dim)
-        Q = self.W_q(x_i).view(B, self.n_heads, self.head_dim)
-        K = self.W_k(x_j).view(B, self.n_heads, self.head_dim)
-        V = self.W_v(x_j).view(B, self.n_heads, self.head_dim)
-
-        # Dot-product attention score: (E, n_heads)
-        attn = (Q * K).sum(dim=-1) / self.scale
-
-        # Edge feature bias: (E, n_heads)
-        edge_bias = self.edge_proj(edge_attr)
-        attn = attn + edge_bias
-
-        # Softmax over neighbors (per head)
-        attn = pyg_softmax(attn, index)                      # (E, n_heads)
-        attn = self.drop(attn)
-
-        # Weighted sum: (E, n_heads, head_dim)
-        out = attn.unsqueeze(-1) * V                         # (E, n_heads, head_dim)
-        out = out.view(B, self.out_dim)                      # (E, out_dim)
-        return self.W_o(out)
-
-    def update(self, aggr_out):
-        return F.gelu(aggr_out)
-
-
-# ═══════════════════════════════════════════════════════════════
-# SECTION 3: Spectral Discrepancy Signal Module
-# ═══════════════════════════════════════════════════════════════
-
-class SpectralDiscrepancyModule(nn.Module):
-    """
-    Computes high-frequency spectral components of the discrepancy graph.
-    
-    Construction:
-    1. Build discrepancy adjacency: A_disc[i,j] = 1 - σ(cos_sim(h_i, h_j))
-       for cross-modal pairs (text-audio, text-facial, audio-facial)
-    
-    2. Symmetric normalized Laplacian:
-       L_sym = I - D^{-1/2} A D^{-1/2}
-    
-    3. Eigendecomposition (approximate via power iteration for efficiency):
-       L = U Λ U^T
-    
-    4. Project onto k HIGH-frequency eigenvectors (large eigenvalues):
-       z_spectral = U_k^T h  →  captures ABNORMAL PATTERNS
-    
-    Biological basis: depression manifests as FLAT AFFECT (abnormally
-    consistent facial/vocal expression regardless of verbal content).
-    This shows up as anomalous HIGH-frequency components in the
-    discrepancy graph spectrum (edges that SHOULD vary but don't).
-    """
-    def __init__(self, hidden_dim: int, n_components: int = 8):
-        super().__init__()
-        self.n_comp = n_components
-        
-        # Learnable projection to build discrepancy matrix
-        self.disc_proj = nn.Linear(hidden_dim, hidden_dim // 2)
-        
-        # After spectral projection: (B, n_comp) → output features
-        self.spectral_out = nn.Sequential(
-            nn.Linear(n_components * 3, hidden_dim // 2),  # 3 modality pairs
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim // 2),
-        )
-
-    def _approx_top_k_eigen(self, L: torch.Tensor, k: int):
-        """
-        Approximate top-k eigenvectors via k steps of power iteration.
-        L: (N, N) symmetric matrix
-        Returns: (N, k) eigenvector matrix
-        
-        Efficient for small N (number of modality segments ≤ 10).
-        """
-        N = L.size(0)
-        device = L.device
-        # Random initialization
-        V = torch.randn(N, k, device=device)
-        V, _ = torch.linalg.qr(V)
-
-        # 5 power iterations (sufficient for approximate eigenvectors)
-        for _ in range(5):
-            V = L @ V
-            V, _ = torch.linalg.qr(V)
-
-        return V  # (N, k)
-
-    def _build_discrepancy_laplacian(self, h_a: torch.Tensor, h_b: torch.Tensor):
-        """
-        h_a, h_b: (B, H) — two modality embeddings from same segments
-        
-        Build discrepancy adjacency matrix between N segments:
-        A[i,j] = 1 - σ(cos_sim(projected_a_i, projected_b_j))
-        
-        This assigns HIGH weight to INCONSISTENT cross-modal pairs
-        (verbal says positive, face shows negative → high discrepancy).
-        
-        Returns: batch of Laplacians (B, N, N) — here N=1 per sample,
-        so we work at segment level across the batch as "nodes".
-        """
-        # Project to lower dim for discrepancy computation
-        pa = F.normalize(self.disc_proj(h_a), dim=-1)  # (B, H//2)
-        pb = F.normalize(self.disc_proj(h_b), dim=-1)  # (B, H//2)
-
-        # Pairwise cosine: (B, B) — treat each sample as a "node"
-        cos_AB = pa @ pb.t()                            # (B, B)
-        A_disc = 1.0 - torch.sigmoid(cos_AB)            # High where inconsistent
-
-        # Symmetric normalize: L = I - D^{-1/2} A D^{-1/2}
-        deg = A_disc.sum(dim=-1).clamp(min=1e-8)
-        d_inv_sqrt = deg.pow(-0.5)
-        D_inv_sqrt = torch.diag(d_inv_sqrt)
-        A_norm = D_inv_sqrt @ A_disc @ D_inv_sqrt
-        L = torch.eye(A_disc.size(0), device=A_disc.device) - A_norm
-
-        return L  # (B, B)
-
-    def forward(self, z_text, z_audio, z_facial):
-        """
-        z_text, z_audio, z_facial: (B, H)
-        
-        Returns: (B, hidden_dim//2) — spectral discrepancy features
-        """
-        k = min(self.n_comp, z_text.size(0) - 1)
-        if k <= 0:
-            # Fallback for batch_size=1
-            return self.spectral_out(
-                torch.zeros(z_text.size(0), self.n_comp * 3, device=z_text.device)
-            )
-
-        # Build 3 discrepancy Laplacians for 3 cross-modal pairs
-        L_ta = self._build_discrepancy_laplacian(z_text,  z_audio)   # text-audio
-        L_tf = self._build_discrepancy_laplacian(z_text,  z_facial)  # text-facial
-        L_af = self._build_discrepancy_laplacian(z_audio, z_facial)  # audio-facial
-
-        # Get top-k high-frequency eigenvectors (detach for stability)
-        U_ta = self._approx_top_k_eigen(L_ta.detach(), k)  # (B, k)
-        U_tf = self._approx_top_k_eigen(L_tf.detach(), k)
-        U_af = self._approx_top_k_eigen(L_af.detach(), k)
-
-        # Project each sample onto its spectral basis
-        # s_ta[i] = U_ta[i, :] = the i-th row = spectral fingerprint of sample i
-        # Then concatenate [U_ta, U_tf, U_af] for each sample
-        # Pad/slice to exactly n_comp
-        def pad_k(U):
-            if U.size(1) < self.n_comp:
-                pad = torch.zeros(U.size(0), self.n_comp - U.size(1), device=U.device)
-                return torch.cat([U, pad], dim=-1)
-            return U[:, :self.n_comp]
-
-        spec_feat = torch.cat([pad_k(U_ta), pad_k(U_tf), pad_k(U_af)], dim=-1)  # (B, 3k)
-        return self.spectral_out(spec_feat)
-
-
-# ═══════════════════════════════════════════════════════════════
-# SECTION 4: Temporal Feature Encoders (with Windowed Self-Attention)
-# ═══════════════════════════════════════════════════════════════
-
-class TemporalEncoder(nn.Module):
-    """
-    Encode a temporal sequence of features into segment-level embeddings
-    using a multi-scale approach:
-    
-    1. Local: 1D-CNN captures short-range patterns (within turn)
-    2. Global: BiLSTM captures long-range dependencies (across turns)
-    3. Adaptive: Attention pooling weights by estimated relevance
-    
-    Produces BOTH:
-    - z_global: (B, H) — session-level embedding
-    - z_segments: (B, N_seg, H) — segment-level embeddings for graph building
-    """
-    def __init__(self, input_dim: int, hidden_dim: int, n_segments: int = 8,
-                 dropout: float = 0.1):
-        super().__init__()
-        self.n_segments = n_segments
-
-        # Local temporal patterns
-        self.local_conv = nn.Sequential(
-            nn.Conv1d(input_dim, hidden_dim, kernel_size=5, padding=2),
-            nn.GELU(),
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.BatchNorm1d(hidden_dim),
-        )
-
-        # Global sequential context
-        self.global_lstm = nn.LSTM(
-            hidden_dim, hidden_dim // 2,
-            num_layers=2, batch_first=True,
-            bidirectional=True, dropout=dropout
-        )
-
-        # Attention pooling
-        self.attn_gate = nn.Linear(hidden_dim, 1)
-        self.drop = nn.Dropout(dropout)
-        self.proj = nn.Linear(hidden_dim, hidden_dim)
-
-    def _segment_features(self, x: torch.Tensor, n: int):
-        """
-        Divide sequence into n segments, mean-pool each.
-        x: (B, T, H) → (B, n, H)
-        """
-        B, T, H = x.shape
-        seg_len = max(T // n, 1)
-        segs = []
-        for i in range(n):
-            start = i * seg_len
-            end   = min(start + seg_len, T)
-            if start >= T:
-                segs.append(torch.zeros(B, H, device=x.device))
-            else:
-                segs.append(x[:, start:end, :].mean(dim=1))
-        return torch.stack(segs, dim=1)  # (B, n, H)
-
-    def forward(self, x, lengths=None):
-        """
-        x: (B, T, input_dim)
-        lengths: (B,)
-        Returns:
-            z_global: (B, hidden_dim)
-            z_segs:   (B, n_segments, hidden_dim)
-        """
-        # CNN
-        h = self.local_conv(x.transpose(1, 2)).transpose(1, 2)   # (B, T, H)
-
-        # LSTM
-        if lengths is not None:
-            packed = nn.utils.rnn.pack_padded_sequence(
-                h, lengths.cpu().clamp(min=1), batch_first=True, enforce_sorted=False
-            )
-            out, _ = self.global_lstm(packed)
-            out, _ = nn.utils.rnn.pad_packed_sequence(out, batch_first=True)
-        else:
-            out, _ = self.global_lstm(h)
-
-        # Segment-level embeddings for graph
-        z_segs = self._segment_features(out, self.n_segments)     # (B, n_seg, H)
-        z_segs = self.proj(z_segs)
-
-        # Attention pooling for global
-        scores = self.attn_gate(out).squeeze(-1)                  # (B, T)
-        if lengths is not None:
-            mask = torch.arange(scores.size(1), device=scores.device).unsqueeze(0) \
-                   >= lengths.unsqueeze(1).to(scores.device)
-            scores = scores.masked_fill(mask, -1e9)
-        weights = F.softmax(scores, dim=-1).unsqueeze(-1)
-        z_global = self.drop(self.proj((out * weights).sum(dim=1)))  # (B, H)
-
-        return z_global, z_segs
-
-
-# ═══════════════════════════════════════════════════════════════
-# SECTION 5: HTDG Builder — Graph Construction from Features
-# ═══════════════════════════════════════════════════════════════
-
-class HTDGBuilder(nn.Module):
-    """
-    Builds the Heterogeneous Temporal Discrepancy Graph (HTDG).
-    
-    Graph topology for ONE sample:
-    - N = 3 × n_seg nodes: [text_0..n, audio_0..n, facial_0..n]
-    
-    Edge types (encoded in edge_attr):
-    ┌──────────────────┬─────────────────────────────────────────┐
-    │ Type ID          │ Meaning                                 │
-    ├──────────────────┼─────────────────────────────────────────┤
-    │ 0: text-temporal │ text_i → text_{i+1} (sequential)        │
-    │ 1: aud-temporal  │ audio_i → audio_{i+1}                   │
-    │ 2: fac-temporal  │ facial_i → facial_{i+1}                 │
-    │ 3: cross-consist │ low-discrepancy cross-modal edges        │
-    │ 4: cross-discord │ HIGH-discrepancy cross-modal edges       │
-    └──────────────────┴─────────────────────────────────────────┘
-    
-    Edge features φ(e_ij) ∈ ℝ^{edge_dim}:
-    [one-hot(type), discrepancy_weight, temporal_distance, direction]
-    
-    KEY INNOVATION: Cross-modal edges are SPLIT by discrepancy threshold.
-    The GNN learns separate aggregation rules for consistent vs discrepant
-    cross-modal evidence — exactly what is needed for depression detection.
-    """
-    def __init__(self, hidden_dim: int, n_seg: int = 8, 
-                 edge_dim: int = 16, disc_threshold: float = 0.4):
-        super().__init__()
-        self.n_seg = n_seg
-        self.edge_dim = edge_dim
-        self.disc_thr = disc_threshold
-
-        # Learnable discrepancy estimator
-        self.disc_query = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.disc_key   = nn.Linear(hidden_dim, hidden_dim // 2)
-
-        # Edge type embeddings (5 types)
-        self.edge_type_emb = nn.Embedding(5, edge_dim // 2)
-
-    def _cosine_discrepancy(self, h_a, h_b):
-        """
-        Compute discrepancy between segment a and b:
-        w = 1 - σ(cos_sim(q(h_a), k(h_b)))
-        
-        h_a, h_b: (..., H) → scalar discrepancy ∈ [0, 1]
-        High w = modalities disagree (discrepant).
-        Low  w = modalities agree (consistent).
-        """
-        qa = F.normalize(self.disc_query(h_a), dim=-1)
-        kb = F.normalize(self.disc_key(h_b), dim=-1)
-        return 1.0 - torch.sigmoid((qa * kb).sum(dim=-1))
-
-    def forward(self, z_text_segs, z_audio_segs, z_facial_segs):
-        """
-        z_*_segs: (B, n_seg, H) — segment-level embeddings
-        
-        Returns per-sample graph components as lists (for batching):
-          node_feats:  (B × 3n_seg, H)
-          edge_indices: list of (2, E_i) tensors
-          edge_attrs:   list of (E_i, edge_dim) tensors
-          batch_vec:    (B × 3n_seg,) — which graph each node belongs to
-        """
-        B, N, H = z_text_segs.shape
-        device = z_text_segs.device
-
-        # Stack all nodes: [text | audio | facial]
-        # Node ID layout: text=[0..N-1], audio=[N..2N-1], facial=[2N..3N-1]
-        all_nodes = torch.cat([z_text_segs, z_audio_segs, z_facial_segs], dim=1)  # (B, 3N, H)
-
-        all_edge_idx  = []
-        all_edge_attr = []
-
-        def make_edge_attr(etype_id, disc_w, temp_dist, direction=0.0):
-            """Build edge feature vector φ(e)."""
-            e_type = self.edge_type_emb(
-                torch.tensor(etype_id, device=device)
-            )  # (edge_dim//2,)
-            scalar = torch.tensor(
-                [disc_w, temp_dist, direction, float(etype_id) / 4.0],
-                device=device, dtype=torch.float32
-            )
-            # Pad scalar to edge_dim//2 and concatenate
-            pad_len = self.edge_dim // 2 - len(scalar)
-            if pad_len > 0:
-                scalar = torch.cat([scalar, torch.zeros(pad_len, device=device)])
-            return torch.cat([e_type, scalar[:self.edge_dim // 2]])  # (edge_dim,)
-
-        for b in range(B):
-            edges_src, edges_dst, edges_attr = [], [], []
-
-            # ── 1. Intra-modal temporal edges (bidirectional) ──
-            for mod_offset, etype in [(0, 0), (N, 1), (2*N, 2)]:
-                for i in range(N - 1):
-                    u, v = mod_offset + i, mod_offset + i + 1
-                    td = 1.0 / N  # normalized temporal distance
-
-                    edges_src.extend([u, v])
-                    edges_dst.extend([v, u])
-                    attr = make_edge_attr(etype, 0.0, td, 1.0)
-                    edges_attr.extend([attr, attr])
-
-            # ── 2. Cross-modal edges (text↔audio, text↔facial, audio↔facial) ──
-            for mod_a, mod_b, off_a, off_b in [
-                ("text",  "audio",  0,    N),
-                ("text",  "facial", 0,    2*N),
-                ("audio", "facial", N,    2*N),
-            ]:
-                for i in range(N):
-                    h_a = all_nodes[b, off_a + i]
-                    h_b = all_nodes[b, off_b + i]
-                    disc = self._cosine_discrepancy(h_a, h_b).item()
-
-                    # Split into consistent (3) vs discrepant (4) edge types
-                    etype = 4 if disc > self.disc_thr else 3
-                    td = 0.0  # same time segment
-
-                    edges_src.extend([off_a + i, off_b + i])
-                    edges_dst.extend([off_b + i, off_a + i])
-                    attr = make_edge_attr(etype, disc, td, 0.0)
-                    edges_attr.extend([attr, attr])
-
-            edge_index = torch.tensor(
-                [edges_src, edges_dst], dtype=torch.long, device=device
-            )
-            edge_attr = torch.stack(edges_attr, dim=0)
-            all_edge_idx.append(edge_index)
-            all_edge_attr.append(edge_attr)
-
-        # Flatten: build a single disconnected graph for the batch
-        node_feats = all_nodes.view(B * 3 * N, H)
-
-        # Offset edge indices by batch
-        flat_edges = []
-        flat_attrs  = []
-        for b in range(B):
-            offset = b * 3 * N
-            flat_edges.append(all_edge_idx[b] + offset)
-            flat_attrs.append(all_edge_attr[b])
-
-        edge_index = torch.cat(flat_edges, dim=1)             # (2, total_E)
-        edge_attr  = torch.cat(flat_attrs, dim=0)             # (total_E, edge_dim)
-
-        # Batch vector for global pooling later
-        batch_vec = torch.arange(B, device=device).repeat_interleave(3 * N)
-
-        return node_feats, edge_index, edge_attr, batch_vec
-
-
-# ═══════════════════════════════════════════════════════════════
-# SECTION 6: Full HTDG-CDL Model
-# ═══════════════════════════════════════════════════════════════
-
-class HTDGCDLModel(nn.Module):
-    """
-    Full HTDG-CDL: Heterogeneous Temporal Discrepancy Graph
-    for Contrastive Discrepancy Learning in Depression Detection.
-    
-    Architecture:
-    ┌──────────────────────────────────────────────────────────┐
-    │  [Text]──────────────────────────────────────────────┐   │
-    │  768-dim BERT → TemporalEncoder → z_text, z_text_segs │   │
-    │                                                        │   │
-    │  [Audio]────────────────────────────────────────────┐  │   │
-    │  88-dim COVAREP → TemporalEncoder → z_audio, segs   │  │   │
-    │                                                      │  │   │
-    │  [Facial]───────────────────────────────────────────┘  │   │
-    │  17-dim AUs → TemporalEncoder → z_facial, segs         │   │
-    │                                                         │   │
-    │  ────────────────────────────────────────────────────   │   │
-    │  HTDGBuilder → G = (V, E, τ_V, τ_E)                    │   │
-    │    ↓ HGA-EF × 2 layers                                  │   │
-    │  z_graph (global mean pool from GNN)                    │   │
-    │                                                         │   │
-    │  SpectralDiscrepancyModule → z_spectral                 │   │
-    │                                                         │   │
-    │  Fusion: [z_text | z_audio | z_facial | z_graph |      │   │
-    │           z_spectral] → BN → MLP                        │   │
-    │                                                         │   │
-    │  → Poincaré Ball → z_hyp (for RMC loss)                │   │
-    │  → PHQ-8 regression head                                │   │
-    │  → Depression classification head                       │   │
-    └──────────────────────────────────────────────────────────┘
-    """
     def __init__(
         self,
-        text_input_dim: int  = 768,
-        audio_input_dim: int = 74,   # COVAREP only
-        facial_input_dim: int = 17,  # AU intensities only
-        nonverbal_input_dim: int = 88,  # combined, for backward compat
-        hidden_dim: int       = 128,
-        n_segments: int       = 8,
-        n_gnn_layers: int     = 2,
-        n_attn_heads: int     = 4,
-        edge_dim: int         = 16,
-        n_spectral: int       = 8,
-        poincare_c: float     = 1.0,
-        dropout: float        = 0.1,
+        alpha: float = 0.75,
+        gamma: float = 2.0,
+        reduction: str = "mean",
+        label_smoothing: float = 0.0,
     ):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.n_seg      = n_segments
+        self.alpha           = alpha
+        self.gamma           = gamma
+        self.reduction       = reduction
+        self.label_smoothing = label_smoothing
 
-        # ── 1. Temporal Encoders ──────────────────────────────────
-        self.text_encoder  = TemporalEncoder(text_input_dim,  hidden_dim, n_segments, dropout)
-        # We treat the combined non-verbal as "audio" for simplicity
-        # but keep separate projections for text vs non-verbal
-        self.nv_encoder    = TemporalEncoder(nonverbal_input_dim, hidden_dim, n_segments, dropout)
-        
-        # Separate projections for audio vs facial within non-verbal
-        # (COVAREP: last 74 dims; AUs: first 14-17 dims)
-        self.audio_proj  = nn.Linear(hidden_dim, hidden_dim)
-        self.facial_proj = nn.Linear(hidden_dim, hidden_dim)
-
-        # ── 2. HTDG Builder ──────────────────────────────────────
-        self.graph_builder = HTDGBuilder(hidden_dim, n_segments, edge_dim)
-
-        # ── 3. HGA-EF GNN Layers ─────────────────────────────────
-        self.gnn_layers = nn.ModuleList([
-            HGAEdgeConv(hidden_dim, hidden_dim, n_attn_heads, edge_dim, dropout)
-            for _ in range(n_gnn_layers)
-        ])
-
-        # ── 4. Spectral Discrepancy Module ───────────────────────
-        self.spectral_module = SpectralDiscrepancyModule(hidden_dim, n_spectral)
-
-        # ── 5. Fusion ─────────────────────────────────────────────
-        # Input: [z_text | z_nv | z_graph | z_spectral]
-        # z_text, z_nv, z_graph: hidden_dim each
-        # z_spectral: hidden_dim // 2
-        # Total = 3 * hidden_dim + hidden_dim // 2
-        fusion_in = hidden_dim * 3 + hidden_dim // 2
-        self.fusion_bn = nn.BatchNorm1d(fusion_in)
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(fusion_in, hidden_dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout / 2),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-        )
-
-        # ── 6. Poincaré Projection ───────────────────────────────
-        self.poincare = PoincareBall(c=poincare_c)
-        self.to_poincare = nn.Linear(hidden_dim // 2, hidden_dim // 2)
-
-        # ── 7. Task Heads ─────────────────────────────────────────
-        head_in = hidden_dim // 2
-        self.phq_head = nn.Sequential(
-            nn.Linear(head_in, 32),
-            nn.GELU(),
-            nn.Linear(32, 1),
-        )
-        self.dep_head = nn.Linear(head_in, 1)
-
-    def _global_mean_pool_graph(self, x, batch_vec, B):
-        """Global mean pooling over graph nodes per sample."""
-        H = x.size(-1)
-        out = torch.zeros(B, H, device=x.device)
-        count = torch.zeros(B, 1, device=x.device)
-        out.scatter_add_(0, batch_vec.unsqueeze(-1).expand_as(x), x)
-        count.scatter_add_(0, batch_vec.unsqueeze(-1), torch.ones(x.size(0), 1, device=x.device))
-        return out / count.clamp(min=1)
-
-    def forward(self, text_feat, nonverbal_feat,
-                text_lengths=None, nonverbal_lengths=None):
+    def forward(self, logits: Tensor, targets: Tensor) -> Tensor:
         """
-        text_feat:      (B, T_text, 768)
-        nonverbal_feat: (B, T_nv, 88)
+        Parameters
+        ----------
+        logits  : (B,) raw logits
+        targets : (B,) binary float {0, 1}
         """
-        B = text_feat.size(0)
+        targets = targets.float()
+        probs   = torch.sigmoid(logits)
 
-        # ── 1. Encode modalities ──────────────────────────────────
-        z_text, z_text_segs = self.text_encoder(text_feat, text_lengths)
-        z_nv, z_nv_segs     = self.nv_encoder(nonverbal_feat, nonverbal_lengths)
-
-        # Decompose non-verbal into "audio" and "facial" sub-representations
-        z_audio  = self.audio_proj(z_nv)
-        z_facial = self.facial_proj(z_nv)
-        z_audio_segs  = self.audio_proj(z_nv_segs)
-        z_facial_segs = self.facial_proj(z_nv_segs)
-
-        # ── 2. Build HTDG and run HGA-EF ─────────────────────────
-        node_feats, edge_index, edge_attr, batch_vec = self.graph_builder(
-            z_text_segs, z_audio_segs, z_facial_segs
+        # Label smoothing: smooth the BCE target while keeping hard targets
+        # for the focal modulating factor (avoids distorting p_t).
+        if self.label_smoothing > 0.0:
+            smooth_t = targets * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
+        else:
+            smooth_t = targets
+        bce     = F.binary_cross_entropy_with_logits(
+            logits, smooth_t, reduction="none"
         )
+        # p_t = p if y=1, else 1-p  (use hard targets for focusing)
+        p_t     = probs * targets + (1.0 - probs) * (1.0 - targets)
+        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+        loss    = alpha_t * (1.0 - p_t) ** self.gamma * bce
 
-        # GNN forward pass
-        h = node_feats
-        for gnn in self.gnn_layers:
-            h = gnn(h, edge_index, edge_attr)
-
-        z_graph = self._global_mean_pool_graph(h, batch_vec, B)
-
-        # ── 3. Spectral Discrepancy Signal ────────────────────────
-        z_spectral = self.spectral_module(z_text, z_audio, z_facial)
-
-        # ── 4. Fusion ─────────────────────────────────────────────
-        fused_raw = torch.cat([z_text, z_nv, z_graph, z_spectral], dim=-1)  # (B, 4H)
-        fused_bn  = self.fusion_bn(fused_raw)
-        fused     = self.fusion_mlp(fused_bn)                               # (B, H//2)
-
-        # ── 5. Hyperbolic projection ──────────────────────────────
-        z_hyp = self.poincare.exp_map_zero(
-            F.tanh(self.to_poincare(fused))                                  # must be in tangent space
-        )
-
-        # ── 6. Predictions ────────────────────────────────────────
-        phq_score = self.phq_head(fused).squeeze(-1) * 27.0
-        dep_logit = self.dep_head(fused).squeeze(-1)
-
-        return {
-            "phq_score":  phq_score,
-            "dep_logit":  dep_logit,
-            "z_hyp":      z_hyp,       # for RMC contrastive loss
-            "z_text":     z_text,
-            "z_nv":       z_nv,
-        }
-
-
-# ═══════════════════════════════════════════════════════════════
-# SECTION 7: Riemannian Manifold Contrastive Loss (RMC)
-# ═══════════════════════════════════════════════════════════════
-
-class RiemannianManifoldContrastiveLoss(nn.Module):
-    """
-    Contrastive loss using POINCARÉ DISTANCE instead of Euclidean.
-    
-    L_RMC = -1/B Σ_i log [ exp(-d_c(z_i, z_i+)/τ) 
-                            / Σ_j exp(-d_c(z_i, z_j)/τ) ]
-    
-    where z+ = another sample of SAME depression class (positive pair)
-    and   z- = samples of DIFFERENT class (negative pairs)
-    
-    Key properties:
-    - d_c respects the curved manifold geometry
-    - Depressed patients cluster near the Poincaré boundary
-    - Non-depressed patients cluster near the origin
-    - Separation in hyperbolic space > Euclidean for hierarchical data
-    
-    τ (temperature): small τ → harder separation
-    """
-    def __init__(self, poincare: PoincareBall, temperature: float = 0.07):
-        super().__init__()
-        self.poincare = poincare
-        self.tau = temperature
-
-    def forward(self, z_hyp: torch.Tensor, labels: torch.Tensor):
-        """
-        z_hyp:  (B, D) — hyperbolic embeddings (on Poincaré ball)
-        labels: (B,)   — binary depression labels {0, 1}
-        
-        Returns: scalar RMC loss
-        """
-        B = z_hyp.size(0)
-        if B < 2:
-            return torch.tensor(0.0, device=z_hyp.device)
-
-        # Pairwise Poincaré distances: (B, B)
-        dist_mat = torch.zeros(B, B, device=z_hyp.device)
-        for i in range(B):
-            for j in range(B):
-                if i != j:
-                    dist_mat[i, j] = self.poincare.distance(
-                        z_hyp[i].unsqueeze(0), z_hyp[j].unsqueeze(0)
-                    ).squeeze()
-
-        # Build positive mask: same label, different sample
-        labels_row = labels.unsqueeze(1).expand(B, B)
-        labels_col = labels.unsqueeze(0).expand(B, B)
-        pos_mask = (labels_row == labels_col) & (~torch.eye(B, dtype=torch.bool, device=z_hyp.device))
-
-        if not pos_mask.any():
-            return torch.tensor(0.0, device=z_hyp.device)
-
-        # Logits = -dist / τ (higher = closer = more similar)
-        logits = -dist_mat / self.tau
-
-        # Mask diagonal
-        logits = logits - 1e9 * torch.eye(B, device=z_hyp.device)
-
-        # Log-softmax over all non-self pairs
-        log_prob = F.log_softmax(logits, dim=-1)  # (B, B)
-
-        # Average loss over positive pairs only
-        loss = -(log_prob * pos_mask.float()).sum() / pos_mask.float().sum().clamp(min=1)
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
         return loss
 
 
-# ═══════════════════════════════════════════════════════════════
-# SECTION 8: Combined CDL Loss with RMC
-# ═══════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-class HTDGCDLLoss(nn.Module):
-    """
-    Combined loss for HTDG-CDL:
-    
-    L = L_MSE(PHQ) + λ_cls · L_BCE(depression) + λ_rmc · L_RMC
-    
-    L_MSE: Normalized mean squared error for PHQ-8 regression
-    L_BCE: Binary cross-entropy for depression classification
-    L_RMC: Riemannian Manifold Contrastive loss in hyperbolic space
-    
-    Note: ALL losses contribute to backprop (unlike previous version
-    which zeroed out BCE). The λ parameters balance the objectives.
-    
-    λ_rmc acts as a geometric regularizer: it forces the hyperbolic
-    embedding to maintain clinically meaningful structure even when
-    the primary regression signal is weak.
-    """
-    def __init__(
-        self,
-        poincare: PoincareBall,
-        lambda_cls: float = 0.5,
-        lambda_rmc: float = 0.3,
-        pos_weight: torch.Tensor = None,
-        phq_max: float = 27.0,
-    ):
+def _xavier_linear(in_f: int, out_f: int, bias: bool = True) -> nn.Linear:
+    layer = nn.Linear(in_f, out_f, bias=bias)
+    nn.init.xavier_uniform_(layer.weight)
+    if bias:
+        nn.init.zeros_(layer.bias)
+    return layer
+
+
+class _MLP(nn.Module):
+    """Two-layer MLP with ReLU + optional dropout."""
+
+    def __init__(self, in_f: int, hidden_f: int, out_f: int,
+                 dropout: float = 0.0):
         super().__init__()
-        self.lambda_cls = lambda_cls
-        self.lambda_rmc = lambda_rmc
-        self.phq_max    = phq_max
-
-        self.mse = nn.MSELoss()
-        self.bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        self.rmc = RiemannianManifoldContrastiveLoss(poincare)
-
-    def forward(self, outputs, phq_labels, dep_labels):
-        """
-        outputs: dict with keys phq_score, dep_logit, z_hyp
-        phq_labels: (B,) continuous PHQ-8 scores
-        dep_labels: (B,) binary {0, 1}
-        """
-        # 1. Regression (MSE on normalized scale)
-        l_reg = self.mse(
-            outputs["phq_score"] / self.phq_max,
-            phq_labels / self.phq_max
+        self.net = nn.Sequential(
+            _xavier_linear(in_f, hidden_f),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout) if dropout > 0 else nn.Identity(),
+            _xavier_linear(hidden_f, out_f),
         )
 
-        # 2. Classification (BCE)
-        l_cls = self.bce(outputs["dep_logit"], dep_labels)
-
-        # 3. Riemannian contrastive
-        l_rmc = self.rmc(outputs["z_hyp"], dep_labels)
-
-        total = l_reg + self.lambda_cls * l_cls + self.lambda_rmc * l_rmc
-
-        return {
-            "total":   total,
-            "l_reg":   l_reg.item(),
-            "l_cls":   l_cls.item(),
-            "l_rmc":   l_rmc.item(),
-        }
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
 
 
-# ═══════════════════════════════════════════════════════════════
-# SECTION 9: Hyperbolic Mixup Augmentation
-# ═══════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# SR-RGAT: Symptom-Routed Relational Graph Attention
+# ─────────────────────────────────────────────────────────────────────────────
 
-def hyperbolic_mixup_batch(z_hyp, phq_scores, dep_labels, poincare, alpha=0.4):
+class SymptomRoutedRGAT(nn.Module):
     """
-    Geodesic mixup in Poincaré ball for data augmentation.
-    
-    For each pair (i, j) in the batch:
-      λ ~ Beta(α, α)
-      z_mix = Exp_0(λ·Log_0(z_i) + (1-λ)·Log_0(z_j))  ← on manifold
-      y_mix_phq = λ·y_i + (1-λ)·y_j                    ← linear label
-      y_mix_dep = round(λ·y_i + (1-λ)·y_j)              ← hard binary
-    
-    This generates O(B²) synthetic samples on the depression
-    severity manifold — addressing DAIC-WOZ's extreme data scarcity.
-    
-    Returns: (z_mix, phq_mix, dep_mix) augmented batch
+    One SR-RGAT layer.
+
+    Forward pass
+    ─────────────
+    Given:
+      h          : (N, H)           node features from previous layer
+      edge_index : (2, E)           COO edge list
+      edge_type  : (E,)             integer in 0..R-1 (R = num_edge_types)
+
+    Returns:
+      h_out      : (N, H)           updated node features
+
+    Algorithm
+    ─────────
+    a. For each edge type t, compute per-edge attention scores over h, then
+       scatter-softmax within each (dst, edge_type) group, and scatter_add
+       to obtain agg_by_type[t]: (N, H).
+
+    b. Stack: agg_stack: (N, R, H)
+
+    c. Routing gate: gate = softmax(routing_mlp(h))   → (N, K)
+
+    d. Symptom-edge attention: sym_edge_w = softmax(learnable W_sym_edge, dim=1)
+       → (K, R): per-symptom preference over edge types.
+
+    e. Symptom channel k:
+         s_k = (agg_stack * sym_edge_w[k].unsqueeze(-1)).sum(1)   (N, H)
+         s_k = W_symptom[k](s_k)                                  (N, H)
+         s_k = s_k * gate[:, k].unsqueeze(-1)                     gated
+
+    f. Cross-symptom fusion:
+         cat([s_0, …, s_{K-1}])   (N, K*H)
+         → cross_symptom_linear   (N, H)
+
+    g. Residual + LayerNorm: h_out = LN(h + h_new)
     """
-    B = z_hyp.size(0)
-    device = z_hyp.device
 
-    # Sample mixing coefficients
-    lam_dist = torch.distributions.Beta(alpha, alpha)
-    lam = lam_dist.sample((B,)).to(device)
+    def __init__(
+        self,
+        hidden_dim:     int = HIDDEN_DIM,
+        num_edge_types: int = NUM_EDGE_TYPES,
+        num_symptoms:   int = NUM_SYMPTOMS,
+        n_heads:        int = 4,
+        dropout:        float = DROPOUT,
+        drop_edge:      float = 0.3,
+    ):
+        super().__init__()
+        self.H  = hidden_dim
+        self.R  = num_edge_types
+        self.K  = num_symptoms
+        self.nh = n_heads
+        self.drop_edge_p = drop_edge
+        assert hidden_dim % n_heads == 0, \
+            "hidden_dim must be divisible by n_heads"
+        self.head_dim = hidden_dim // n_heads
 
-    # Random pairing
-    perm = torch.randperm(B, device=device)
-    z_j   = z_hyp[perm]
-    phq_j = phq_scores[perm]
-    dep_j = dep_labels[perm]
+        # ── Per-edge-type attention projections ───────────────────────────────
+        # We share the key/query/value projections across edge types but use a
+        # separate bias per edge type (efficient and expressive).
+        self.W_q = nn.Parameter(torch.empty(num_edge_types, hidden_dim, hidden_dim))
+        self.W_k = nn.Parameter(torch.empty(num_edge_types, hidden_dim, hidden_dim))
+        self.W_v = nn.Parameter(torch.empty(num_edge_types, hidden_dim, hidden_dim))
+        for w in (self.W_q, self.W_k, self.W_v):
+            nn.init.xavier_uniform_(w.view(num_edge_types * hidden_dim, hidden_dim))
 
-    # Geodesic interpolation on Poincaré ball
-    z_mix = poincare.hyperbolic_mixup(z_hyp, z_j, lam.unsqueeze(-1))
+        # ── Routing gate: H → K ───────────────────────────────────────────────
+        self.routing_mlp = _MLP(hidden_dim, hidden_dim, num_symptoms, dropout=dropout)
 
-    # Label interpolation
-    phq_mix = lam * phq_scores + (1 - lam) * phq_j
-    dep_mix = (lam * dep_labels + (1 - lam) * dep_j).round()
+        # ── Symptom-edge preference: learnable (K, R) ─────────────────────────
+        self.sym_edge_logits = nn.Parameter(
+            torch.empty(num_symptoms, num_edge_types)
+        )
+        nn.init.xavier_uniform_(self.sym_edge_logits)
 
-    return z_mix, phq_mix, dep_mix
+        # ── Per-symptom transform: K × Linear(H, H) ──────────────────────────
+        self.W_symptom = nn.ModuleList([
+            _xavier_linear(hidden_dim, hidden_dim, bias=True)
+            for _ in range(num_symptoms)
+        ])
+
+        # ── Cross-symptom fusion ──────────────────────────────────────────────
+        self.cross_symptom_linear = _xavier_linear(
+            num_symptoms * hidden_dim, hidden_dim
+        )
+
+        # ── Residual normalisation ────────────────────────────────────────────
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.dropout    = nn.Dropout(p=dropout)
+
+        # Scaling factor for attention
+        self._scale = math.sqrt(self.head_dim)
+
+    # ── Relational aggregation ────────────────────────────────────────────────
+
+    def _relational_agg(
+        self,
+        h: Tensor,           # (N, H)
+        edge_index: Tensor,  # (2, E)
+        edge_type:  Tensor,  # (E,)
+    ) -> Tensor:
+        """
+        Compute attention-weighted aggregation for each edge type.
+        Returns agg_stack: (N, R, H).
+        """
+        N, H = h.shape
+        R    = self.R
+        device = h.device
+
+        agg_stack = torch.zeros(N, R, H, device=device, dtype=h.dtype)
+
+        if edge_index.shape[1] == 0:
+            return agg_stack
+
+        src_idx = edge_index[0]   # (E,)
+        dst_idx = edge_index[1]   # (E,)
+
+        for t in range(R):
+            mask = (edge_type == t)
+            if not mask.any():
+                continue
+
+            e_src = src_idx[mask]   # (E_t,)
+            e_dst = dst_idx[mask]   # (E_t,)
+
+            h_src = h[e_src]        # (E_t, H)
+            h_dst = h[e_dst]        # (E_t, H) – query from destination
+
+            # Project
+            Wq = self.W_q[t]        # (H, H)
+            Wk = self.W_k[t]
+            Wv = self.W_v[t]
+
+            q = h_dst @ Wq.t()     # (E_t, H)
+            k = h_src @ Wk.t()     # (E_t, H)
+            v = h_src @ Wv.t()     # (E_t, H)
+
+            # Multi-head attention score: reshape to (E_t, nh, head_dim)
+            q = q.view(-1, self.nh, self.head_dim)
+            k = k.view(-1, self.nh, self.head_dim)
+            v = v.view(-1, self.nh, self.head_dim)
+
+            # Score: (E_t, nh)
+            score = (q * k).sum(-1) / self._scale   # (E_t, nh)
+
+            # scatter_softmax per (dst, head) – treat as (E_t * nh,)
+            E_t    = e_dst.shape[0]
+            dst_exp = e_dst.unsqueeze(1).expand(E_t, self.nh).reshape(-1)   # (E_t*nh,)
+            score_flat = score.reshape(-1)
+            alpha_flat  = scatter_softmax(score_flat, dst_exp, dim=0,
+                                          dim_size=N)                        # (E_t*nh,)
+            alpha = alpha_flat.view(E_t, self.nh, 1)                        # (E_t, nh, 1)
+
+            # Weighted values
+            weighted_v = (alpha * v).view(E_t, H)                           # (E_t, H)
+
+            # Aggregate to destination
+            agg_t = scatter_add(weighted_v, e_dst, dim=0, dim_size=N)       # (N, H)
+            agg_stack[:, t, :] = agg_t
+
+        return agg_stack
+
+    # ── Full forward ──────────────────────────────────────────────────────────
+
+    def forward(
+        self,
+        h: Tensor,
+        edge_index: Tensor,
+        edge_type:  Tensor,
+    ) -> Tensor:
+        """
+        Parameters
+        ----------
+        h          : (N, H)
+        edge_index : (2, E)
+        edge_type  : (E,)
+
+        Returns
+        -------
+        h_out : (N, H)
+        """
+        N = h.shape[0]
+
+        # DropEdge: randomly remove edges during training for regularization
+        if self.training and self.drop_edge_p > 0.0 and edge_index.shape[1] > 0:
+            keep_mask = torch.rand(edge_index.shape[1], device=h.device) > self.drop_edge_p
+            edge_index = edge_index[:, keep_mask]
+            edge_type  = edge_type[keep_mask]
+
+        # a–b. Relational aggregation → (N, R, H)
+        agg_stack = self._relational_agg(h, edge_index, edge_type)
+
+        # c. Routing gate (N, K) via softmax
+        gate = F.softmax(self.routing_mlp(h), dim=-1)          # (N, K)
+
+        # d. Symptom-edge preference (K, R) via softmax over edge-type dim
+        sym_edge_w = F.softmax(self.sym_edge_logits, dim=1)    # (K, R)
+
+        # e. Per-symptom channel
+        symptom_channels = []
+        for k in range(self.K):
+            # Weighted sum over edge types: (N, R, H) × (R,) → (N, H)
+            edge_weights = sym_edge_w[k]                       # (R,)
+            s_k = (agg_stack * edge_weights.view(1, self.R, 1)).sum(dim=1)  # (N, H)
+            s_k = self.W_symptom[k](s_k)                       # (N, H)
+            s_k = F.relu(s_k)
+            # Gate by routing probability for symptom k
+            s_k = s_k * gate[:, k].unsqueeze(-1)               # (N, H)
+            symptom_channels.append(s_k)
+
+        # f. Cross-symptom fusion
+        cat_symptoms = torch.cat(symptom_channels, dim=-1)     # (N, K*H)
+        h_new = self.cross_symptom_linear(cat_symptoms)        # (N, H)
+        h_new = F.relu(h_new)
+        h_new = self.dropout(h_new)
+
+        # g. Residual + LayerNorm
+        h_out = self.layer_norm(h + h_new)
+        return h_out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Modal-specific encoder block
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ModalEncoder(nn.Module):
+    """Linear(in_f, H) + LayerNorm + ReLU + Dropout."""
+
+    def __init__(self, in_features: int, hidden_dim: int, dropout: float = DROPOUT):
+        super().__init__()
+        self.net = nn.Sequential(
+            _xavier_linear(in_features, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HMSGNet: full model
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HMSGNet(nn.Module):
+    """
+    Heterogeneous Multi-modal Symptom-Guided Network.
+
+    Input  : PyG Batch with fields: x, edge_index, edge_type, node_type,
+             pos, batch (standard PyG batch vector).
+    Output : (dep_logit, symptom_logits, phq_pred)
+               dep_logit      : (B,)     depression logit
+               symptom_logits : (B, 8)   PHQ-8 item logits
+               phq_pred       : (B,)     continuous PHQ score prediction
+    """
+
+    def __init__(
+        self,
+        hidden_dim:     int   = HIDDEN_DIM,
+        num_gnn_layers: int   = NUM_GNN_LAYERS,
+        num_edge_types: int   = NUM_EDGE_TYPES,
+        num_symptoms:   int   = NUM_SYMPTOMS,
+        n_heads:        int   = 4,
+        dropout:        float = DROPOUT,
+        drop_edge:      float = 0.3,
+        feat_noise:     float = 0.05,
+        text_dim:       int   = TEXT_DIM,
+        audio_dim:      int   = AUDIO_DIM,
+        video_dim:      int   = VIDEO_DIM,
+    ):
+        super().__init__()
+        self.H   = hidden_dim
+        self.K   = num_symptoms
+        self.dropout_p  = dropout
+        self.feat_noise = feat_noise
+        self._text_dim  = text_dim
+        self._audio_dim = audio_dim
+
+        # ── Modal-specific encoders ───────────────────────────────────────────
+        self.text_encoder  = ModalEncoder(text_dim,  hidden_dim, dropout)
+        self.audio_encoder = ModalEncoder(audio_dim, hidden_dim, dropout)
+        self.video_encoder = ModalEncoder(video_dim, hidden_dim, dropout)
+
+        # ── Node-type embedding ───────────────────────────────────────────────
+        self.node_type_emb = nn.Embedding(3, hidden_dim)
+        nn.init.normal_(self.node_type_emb.weight, std=0.02)
+
+        # ── Positional embedding (scalar → H via small MLP) ───────────────────
+        self.pos_encoder = nn.Sequential(
+            _xavier_linear(1, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            _xavier_linear(hidden_dim // 2, hidden_dim),
+        )
+
+        # ── SR-RGAT layers ────────────────────────────────────────────────────
+        self.gnn_layers = nn.ModuleList([
+            SymptomRoutedRGAT(
+                hidden_dim=hidden_dim,
+                num_edge_types=num_edge_types,
+                num_symptoms=num_symptoms,
+                n_heads=n_heads,
+                dropout=dropout,
+                drop_edge=drop_edge,
+            )
+            for _ in range(num_gnn_layers)
+        ])
+
+        # ── Attention readout (per modality) ──────────────────────────────────
+        self.text_att  = _xavier_linear(hidden_dim, 1)
+        self.audio_att = _xavier_linear(hidden_dim, 1)
+        self.video_att = _xavier_linear(hidden_dim, 1)
+
+        # ── Cross-modal gated fusion ──────────────────────────────────────────
+        self.modal_fusion = nn.Sequential(
+            _xavier_linear(3 * hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+        )
+
+        # ── Task heads ────────────────────────────────────────────────────────
+        # Depression binary head
+        self.dep_head = nn.Sequential(
+            _xavier_linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            _xavier_linear(hidden_dim // 2, 1),
+        )
+
+        # PHQ-8 per-item heads (K separate linear projections)
+        self.symptom_heads = nn.ModuleList([
+            _xavier_linear(hidden_dim, 1) for _ in range(num_symptoms)
+        ])
+
+        # PHQ continuous score head
+        self.phq_head = _xavier_linear(hidden_dim, 1)
+
+    # ── Per-modality feature extraction from the unified x ───────────────────
+
+    def _encode_by_node_type(
+        self,
+        x:         Tensor,   # (N_total_in_batch, unified_dim)
+        node_type: Tensor,   # (N_total_in_batch,)
+    ) -> Tensor:
+        """
+        Route each row of x to its modal encoder and return h: (N_total, H).
+        Only the relevant slice of x is fed to each encoder.
+        """
+        device = x.device
+        H      = self.H
+        N      = x.shape[0]
+        h      = torch.zeros(N, H, device=device, dtype=x.dtype)
+
+        # Feature noise augmentation during training
+        if self.training and self.feat_noise > 0.0:
+            x = x + torch.randn_like(x) * self.feat_noise
+
+        t_dim = self._text_dim
+        a_dim = self._audio_dim
+
+        # Text nodes (node_type == 0): first t_dim dims
+        mask0 = (node_type == 0)
+        if mask0.any():
+            h[mask0] = self.text_encoder(x[mask0, :t_dim])
+
+        # Audio nodes (node_type == 1): dims t_dim .. t_dim+a_dim
+        mask1 = (node_type == 1)
+        if mask1.any():
+            h[mask1] = self.audio_encoder(x[mask1, t_dim: t_dim + a_dim])
+
+        # Video nodes (node_type == 2): remaining dims
+        mask2 = (node_type == 2)
+        if mask2.any():
+            h[mask2] = self.video_encoder(x[mask2, t_dim + a_dim:])
+
+        return h
+
+    # ── Attention pooling within each graph-modality group ───────────────────
+
+    @staticmethod
+    def _att_pool(
+        h:      Tensor,    # (N_mod_in_batch, H)
+        idx:    Tensor,    # (N_mod_in_batch,)  graph indices in batch
+        att_w:  Tensor,    # (N_mod_in_batch, 1)
+        B:      int,
+    ) -> Tensor:
+        """
+        Soft-attention pool over nodes belonging to the same graph.
+        Returns (B, H).
+        """
+        device = h.device
+        # Scatter-softmax over per-graph subsets
+        alpha = scatter_softmax(att_w.squeeze(-1), idx, dim=0, dim_size=B)  # (N_mod,)
+        out   = scatter_add(h * alpha.unsqueeze(-1), idx, dim=0, dim_size=B)  # (B, H)
+        return out
+
+    # ── Forward ───────────────────────────────────────────────────────────────
+
+    def forward(self, data) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Parameters
+        ----------
+        data : torch_geometric.data.Batch (or Data for single graph)
+            Required fields: x, edge_index, edge_type, node_type, pos, batch
+
+        Returns
+        -------
+        dep_logit      : (B,)
+        symptom_logits : (B, K)
+        phq_pred       : (B,)
+        """
+        x          = data.x          # (N_total, 912)
+        edge_index = data.edge_index  # (2, E_total)
+        edge_type  = data.edge_type   # (E_total,)
+        node_type  = data.node_type   # (N_total,)
+        pos        = data.pos         # (N_total,)
+        batch      = data.batch       # (N_total,)  graph assignment
+
+        B = int(batch.max().item()) + 1   # batch size
+
+        # 1. Modal-specific encoding
+        h = self._encode_by_node_type(x, node_type)   # (N_total, H)
+
+        # 2. Add positional and node_type embeddings
+        pos_emb  = self.pos_encoder(pos.unsqueeze(-1))        # (N_total, H)
+        type_emb = self.node_type_emb(node_type)              # (N_total, H)
+        h = h + pos_emb + type_emb
+
+        # 3. SR-RGAT layers
+        for gnn in self.gnn_layers:
+            h = gnn(h, edge_index, edge_type)
+
+        # 4. Attention readout per modality
+        mask_t = (node_type == 0)
+        mask_a = (node_type == 1)
+        mask_v = (node_type == 2)
+
+        h_t = h[mask_t]              # (N_text_total, H)
+        h_a = h[mask_a]              # (N_audio_total, H)
+        h_v = h[mask_v]              # (N_video_total, H)
+
+        batch_t = batch[mask_t]
+        batch_a = batch[mask_a]
+        batch_v = batch[mask_v]
+
+        att_t = torch.sigmoid(self.text_att(h_t))    # (N_text_total, 1)
+        att_a = torch.sigmoid(self.audio_att(h_a))
+        att_v = torch.sigmoid(self.video_att(h_v))
+
+        text_emb  = self._att_pool(h_t, batch_t, att_t, B)   # (B, H)
+        audio_emb = self._att_pool(h_a, batch_a, att_a, B)
+        video_emb = self._att_pool(h_v, batch_v, att_v, B)
+
+        # 5. Cross-modal gated fusion
+        fused = self.modal_fusion(
+            torch.cat([text_emb, audio_emb, video_emb], dim=-1)
+        )                                                       # (B, H)
+
+        # 6. Task heads
+        dep_logit = self.dep_head(fused).squeeze(-1)            # (B,)
+
+        symptom_logits = torch.cat(
+            [head(fused) for head in self.symptom_heads], dim=-1
+        )                                                        # (B, K)
+
+        phq_pred = self.phq_head(fused).squeeze(-1)              # (B,)
+
+        return dep_logit, symptom_logits, phq_pred
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compute_loss
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_loss(
+    dep_logit:       Tensor,    # (B,)
+    symptom_logits:  Tensor,    # (B, 8)
+    phq_pred:        Tensor,    # (B,)
+    dep_labels:      Tensor,    # (B,)  {0, 1}
+    phq8_labels:     Tensor,    # (B, 8) per-item scores (0..3 as float)
+    phq_scores:      Tensor,    # (B,)  total PHQ score
+    w_symptom:       float = 0.3,
+    w_phq:           float = 0.1,
+    focal_alpha:     float = 0.80,   # pass 0.70 for DAIC-WOZ
+    label_smoothing: float = 0.0,    # pass 0.10 for DAIC-WOZ
+    device:          Optional[torch.device] = None,
+) -> Tuple[Tensor, dict]:
+    """
+    Combined loss:
+        L = FocalLoss(dep) + w_symptom * BCE(symptoms) + w_phq * SmoothL1(phq)
+
+    Returns (total_loss, loss_dict) where loss_dict contains the individual
+    loss components for logging.
+    """
+    dep_labels  = dep_labels.float()
+    phq8_labels = phq8_labels.float()
+    phq_scores  = phq_scores.float()
+
+    # PyG batches phq8 as (B*8,) — reshape to (B, 8)
+    B = dep_logit.shape[0]
+    if phq8_labels.dim() == 1 and phq8_labels.shape[0] == B * 8:
+        phq8_labels = phq8_labels.view(B, 8)
+
+    # Depression focal loss (alpha and label_smoothing are configurable per dataset)
+    focal_fn = FocalLoss(alpha=focal_alpha, gamma=2.0, reduction="mean",
+                         label_smoothing=label_smoothing)
+    loss_dep = focal_fn(dep_logit, dep_labels)
+
+    # PHQ-8 item BCE (binarise: item > 0 → positive)
+    phq8_binary = (phq8_labels > 0).float()
+    loss_symp   = F.binary_cross_entropy_with_logits(
+        symptom_logits, phq8_binary, reduction="mean"
+    )
+
+    # PHQ continuous score regression (normalise by 24 to be ≈ unit scale)
+    loss_phq = F.smooth_l1_loss(phq_pred, phq_scores / 24.0, reduction="mean")
+
+    total = loss_dep + w_symptom * loss_symp + w_phq * loss_phq
+
+    loss_dict = {
+        "loss_total":   total.item(),
+        "loss_dep":     loss_dep.item(),
+        "loss_symptom": loss_symp.item(),
+        "loss_phq":     loss_phq.item(),
+    }
+    return total, loss_dict
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quick smoke-test
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    from torch_geometric.data import Data, Batch
+
+    def _make_dummy(n_utt: int = 20, pid: int = 0):
+        N  = 3 * n_utt
+        ei, et = [], []
+        for i in range(n_utt):
+            for j in range(max(0, i - 3), min(n_utt, i + 4)):
+                if i != j:
+                    ei.append([i, j])
+                    et.append(0)
+                    ei.append([n_utt + i, n_utt + j])
+                    et.append(1)
+                    ei.append([2 * n_utt + i, 2 * n_utt + j])
+                    et.append(2)
+            # cross-modal
+            for src_off, dst_off, t in [
+                (0, n_utt, 3), (n_utt, 0, 4),
+                (0, 2*n_utt, 5), (2*n_utt, 0, 6),
+                (n_utt, 2*n_utt, 7), (2*n_utt, n_utt, 8),
+            ]:
+                ei.append([src_off + i, dst_off + i])
+                et.append(t)
+
+        edge_index = torch.tensor(ei, dtype=torch.long).t().contiguous()
+        edge_type  = torch.tensor(et, dtype=torch.long)
+        node_type  = torch.tensor([0]*n_utt + [1]*n_utt + [2]*n_utt, dtype=torch.long)
+        pos        = torch.linspace(0, 1, n_utt).repeat(3)
+        x          = torch.randn(N, UNIFIED_DIM)
+        y          = torch.tensor([1], dtype=torch.long)
+        phq_score  = torch.tensor([10.0])
+        phq8       = torch.rand(8)
+        return Data(x=x, edge_index=edge_index, edge_type=edge_type,
+                    node_type=node_type, pos=pos, y=y,
+                    phq_score=phq_score, phq8=phq8)
+
+    graphs = [_make_dummy(20), _make_dummy(15)]
+    batch  = Batch.from_data_list(graphs)
+
+    model = HMSGNet()
+    model.eval()
+    with torch.no_grad():
+        dep_logit, sym_logits, phq_pred = model(batch)
+    print(f"dep_logit:      {dep_logit.shape}")     # (2,)
+    print(f"symptom_logits: {sym_logits.shape}")    # (2, 8)
+    print(f"phq_pred:       {phq_pred.shape}")      # (2,)
+
+    dep_labels = batch.y.squeeze()
+    phq8_lbl   = torch.stack([d.phq8 for d in graphs])
+    phq_scores = batch.phq_score.squeeze()
+    loss, ld   = compute_loss(dep_logit, sym_logits, phq_pred,
+                              dep_labels, phq8_lbl, phq_scores)
+    print(f"loss: {loss.item():.4f}  {ld}")
+    print("Smoke-test PASSED.")

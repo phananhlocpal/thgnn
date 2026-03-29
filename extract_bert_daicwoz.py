@@ -74,9 +74,12 @@ def extract_bert_features(
     except Exception:
         df = pd.read_csv(transcript_path, on_bad_lines='skip')
 
-    # Filter participant turns
+    # Strip space-padded column names (DAIC-WOZ files can have ' speaker', ' value')
+    df.columns = df.columns.str.strip()
+
+    # Filter participant turns — case-insensitive to match any capitalisation
     if 'speaker' in df.columns:
-        df = df[df['speaker'].str.lower() == 'participant']
+        df = df[df['speaker'].str.strip().str.lower() == 'participant']
     if 'value' not in df.columns:
         df['value'] = ''
 
@@ -108,7 +111,7 @@ def extract_bert_features(
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root",  default="data/daicwoz/")
+    p.add_argument("--data_root",  default="C:/Users/ezycloudx-admin/Desktop/thgnn/daicwoz/")
     p.add_argument("--split_csv",  required=True, help="Train or dev CSV with Participant_ID")
     p.add_argument("--model_name", default="mental/mental-bert-base-uncased",
                    help="HuggingFace model. 'mental/mental-bert-base-uncased' recommended for clinical text")

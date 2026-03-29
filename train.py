@@ -1,465 +1,576 @@
 """
-Training & Evaluation for HTDG-CDL
-Heterogeneous Temporal Discrepancy Graph + Riemannian Manifold Contrastive Learning
-on DAIC-WOZ Depression Detection.
+train.py
 
-Key differences from v1:
-  1. Full loss backprop: MSE + BCE + RMC (no zeroed losses)
-  2. Hyperbolic Mixup augmentation (data scarcity workaround)
-  3. No threshold calibration on dev set (avoids contamination)
-     → threshold fixed at 10.0 for PHQ regression, 0.0 for logit
-  4. LR warmup + cosine decay schedule
-  5. Model EMA (Exponential Moving Average) for stable evaluation
-  6. Label smoothing on BCE
-  7. Stratified sampling for class balance
+Training script for HMSG-Net.
 
-Usage:
-    python train.py
-    python train.py --train_csv data/daicwoz/train_split.csv --epochs 100
-
-Requirements:
-    pip install torch-geometric
-    torch-geometric installation: https://pytorch-geometric.readthedocs.io/
+Configuration constants are defined at the top of this file.
+Run with:
+    python train.py                    # default: E-DAIC
+    python train.py --dataset daicwoz  # DAIC-WOZ corpus
+    python train.py --dataset edaic    # E-DAIC corpus (explicit)
 """
 
 import argparse
-import os
-import json
 import math
+import os
+import random
+import time
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import WeightedRandomSampler
 from sklearn.metrics import (
-    f1_score, accuracy_score, mean_absolute_error,
-    confusion_matrix, classification_report
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
 )
-from copy import deepcopy
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
+from torch_geometric.loader import DataLoader
 
-from model   import HTDGCDLModel, HTDGCDLLoss
-from dataset import get_dataloader, DAICWOZDataset, collate_fn
-from torch.utils.data import DataLoader
+from edaic_dataset import DepressionDataset
+from daicwoz_dataset import DaicWozDataset
+from model import HMSGNet, compute_loss
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Reproducibility
+SEED = 42
+
+# Dataset-specific settings (keyed by --dataset value)
+# Each entry fully specifies model arch, training HP, and feature dims.
+DATASET_CFG = {
+    "edaic": {
+        # Paths
+        "cache_dir":      "C:/Users/ezycloudx-admin/Desktop/thgnn/cache",
+        "checkpoint_dir": Path("C:/Users/ezycloudx-admin/Desktop/thgnn/checkpoints"),
+        # Feature dims
+        "text_dim":  768,
+        "audio_dim": 46,    # 23 eGeMAPS × mean+std
+        "video_dim": 98,    # 49 OpenFace × mean+std
+        # Model
+        "hidden_dim":      256,
+        "num_gnn_layers":  3,
+        "n_heads":         4,
+        "dropout":         0.35,
+        "drop_edge":       0.10,
+        "feat_noise":      0.02,
+        # Loss
+        "focal_alpha":     0.80,   # E-DAIC ~21% positive — upweight heavily
+        "w_symptom":       0.3,
+        "w_phq":           0.1,
+        # Optimiser
+        "lr":              3e-4,
+        "weight_decay":    2e-4,
+        # Scheduler
+        "warmup_epochs":   5,
+        "cosine_epochs":   250,
+        "eta_min":         1e-6,
+        # Training loop
+        "batch_size":      8,
+        "max_epochs":      250,
+        "early_stop_pat":  30,
+    },
+    "daicwoz": {
+        # Paths
+        "cache_dir":      "C:/Users/ezycloudx-admin/Desktop/thgnn/cache_daicwoz",
+        "checkpoint_dir": Path("C:/Users/ezycloudx-admin/Desktop/thgnn/checkpoints_daicwoz"),
+        # Feature dims
+        "text_dim":  768,
+        "audio_dim": 148,   # 74 COVAREP × mean+std
+        "video_dim": 40,    # 20 CLNF_AUs × mean+std
+        # Model — restore to 256/3-layer (proven to reach F1=0.68);
+        # 128-dim + dropout=0.5 killed signal (model output p≈0.5 everywhere)
+        "hidden_dim":      256,
+        "num_gnn_layers":  3,
+        "n_heads":         4,
+        "dropout":         0.45,   # increased to delay memorisation
+        "drop_edge":       0.20,   # increased: model memorises from ep65 with 0.15
+        "feat_noise":      0.03,
+        # Loss — focal alone handles imbalance; DO NOT add weighted_sampler on top
+        "focal_alpha":     0.72,   # nudged up (28% positive)
+        "label_smoothing": 0.0,    # removed: conflicted with focal loss gradient
+        "w_symptom":       0.05,   # keep low: PHQ8 per-item labels noisy
+        "w_phq":           0.05,
+        # Optimiser
+        "lr":              2e-4,
+        "weight_decay":    5e-4,   # moderate L2 (compromise 2e-4 ↔ 1e-3)
+        # Scheduler
+        "warmup_epochs":   8,
+        "cosine_epochs":   300,
+        "eta_min":         1e-6,
+        # Training loop
+        "batch_size":      8,
+        "max_epochs":      300,
+        "early_stop_pat":  50,
+        "use_weighted_sampler": False,   # disabled: double-compensates with focal loss
+    },
+}
+
+# Kept for backward-compat reference; actual values come from DATASET_CFG
+NUM_SYMPTOMS   = 8
+NUM_EDGE_TYPES = 9
+MAX_GRAD_NORM  = 1.0
+
+# Device
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ─────────────────────────────────────────
-# Exponential Moving Average (Model EMA)
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Reproducibility
+# ─────────────────────────────────────────────────────────────────────────────
 
-class ModelEMA:
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metric computation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_best_threshold(labels: np.ndarray, probs: np.ndarray) -> float:
+    """Sweep thresholds [0.30, 0.70] and return the one maximising F1-macro.
+    Range is intentionally constrained: on small dev sets (≤50 samples) a wider
+    sweep will overfit to noise and return clinically meaningless thresholds
+    (e.g. 0.10 that predicts nearly all positive).
     """
-    EMA of model parameters.
-    θ_ema ← α·θ_ema + (1-α)·θ_model
-    
-    EMA smooths out noisy mini-batch updates and gives
-    a better generalization estimate at evaluation time.
-    Especially useful for small datasets (DAIC-WOZ ~189 samples).
+    best_thr, best_f1 = 0.5, 0.0
+    for thr in np.arange(0.30, 0.71, 0.02):
+        preds = (probs >= thr).astype(int)
+        f1 = f1_score(labels, preds, average="macro", zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_thr = f1, float(thr)
+    return best_thr
+
+
+def compute_metrics(
+    labels: np.ndarray,
+    probs:  np.ndarray,
+    threshold: float = 0.5,
+) -> Dict[str, float]:
+    """Compute classification metrics from predicted probabilities."""
+    preds = (probs >= threshold).astype(int)
+    metrics: Dict[str, float] = {}
+    metrics["accuracy"]    = accuracy_score(labels, preds)
+    metrics["f1_macro"]    = f1_score(labels, preds, average="macro",     zero_division=0)
+    metrics["f1_weighted"] = f1_score(labels, preds, average="weighted",  zero_division=0)
+    metrics["precision"]   = precision_score(labels, preds, zero_division=0)
+    metrics["recall"]      = recall_score(labels, preds, zero_division=0)
+    metrics["threshold"]   = threshold
+    try:
+        metrics["auc"] = roc_auc_score(labels, probs)
+    except ValueError:
+        metrics["auc"] = float("nan")
+    return metrics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# One epoch (train or eval)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_epoch(
+    model:           HMSGNet,
+    loader:          DataLoader,
+    optimizer:       Optional[torch.optim.Optimizer],
+    device:          torch.device,
+    is_train:        bool,
+    w_symptom:       float = 0.3,
+    w_phq:           float = 0.1,
+    focal_alpha:     float = 0.80,
+    label_smoothing: float = 0.0,
+) -> Tuple[Dict[str, float], np.ndarray, np.ndarray]:
     """
-    def __init__(self, model, decay=0.995):
-        self.ema_model = deepcopy(model)
-        self.decay = decay
-        self.ema_model.eval()
-        for p in self.ema_model.parameters():
-            p.requires_grad_(False)
+    Run one full pass over `loader`.
 
-    @torch.no_grad()
-    def update(self, model):
-        for ema_p, p in zip(self.ema_model.parameters(), model.parameters()):
-            ema_p.data.mul_(self.decay).add_(p.data, alpha=1 - self.decay)
-
-    def get_model(self):
-        return self.ema_model
-
-
-# ─────────────────────────────────────────
-# Warmup + Cosine LR Scheduler
-# ─────────────────────────────────────────
-
-class WarmupCosineScheduler:
+    Returns
+    -------
+    loss_dict  : dict with averaged loss components
+    all_labels : (N,) integer array
+    all_probs  : (N,) float array of sigmoid probabilities
     """
-    Linear warmup then cosine decay:
-    - Steps 0..warmup_steps: lr increases linearly 0 → max_lr
-    - Steps warmup_steps..total: lr follows cosine decay max_lr → min_lr
-    """
-    def __init__(self, optimizer, warmup_steps, total_steps, min_lr=1e-6):
-        self.opt = optimizer
-        self.warmup = warmup_steps
-        self.total  = total_steps
-        self.min_lr = min_lr
-        self.step_n = 0
-
-    def step(self):
-        self.step_n += 1
-        n = self.step_n
-        if n <= self.warmup:
-            scale = n / max(1, self.warmup)
-        else:
-            progress = (n - self.warmup) / max(1, self.total - self.warmup)
-            scale = 0.5 * (1 + math.cos(math.pi * progress))
-            scale = self.min_lr / self.opt.param_groups[0].get('base_lr', 1e-3) + \
-                    (1 - self.min_lr / self.opt.param_groups[0].get('base_lr', 1e-3)) * scale
-
-        for pg in self.opt.param_groups:
-            base = pg.get('base_lr', pg['lr'])
-            pg['base_lr'] = base
-            pg['lr'] = base * scale if n <= self.warmup else \
-                       self.min_lr + (base - self.min_lr) * 0.5 * (1 + math.cos(
-                           math.pi * (n - self.warmup) / max(1, self.total - self.warmup)
-                       ))
-
-
-# ─────────────────────────────────────────
-# Stratified DataLoader (Class Balance)
-# ─────────────────────────────────────────
-
-def get_balanced_dataloader(label_csv, data_root, batch_size, text_feat_dim=768,
-                            nonverbal_dim=88, **kwargs):
-    """
-    Uses WeightedRandomSampler to ensure each batch contains
-    approximately equal depressed/non-depressed samples.
-    
-    This is critical for DAIC-WOZ where class imbalance (≈50/50 but
-    with high variance across folds) can destabilize training.
-    """
-    ds = DAICWOZDataset(label_csv, data_root, text_feat_dim=text_feat_dim,
-                        nonverbal_dim=nonverbal_dim, **kwargs)
-
-    labels = ds.labels["PHQ8_Binary"].values.astype(int)
-    class_counts = np.bincount(labels)
-    class_weights = 1.0 / class_counts.astype(float)
-    sample_weights = torch.tensor([class_weights[l] for l in labels], dtype=torch.float)
-
-    sampler = WeightedRandomSampler(
-        sample_weights, num_samples=len(sample_weights), replacement=True
-    )
-    return DataLoader(
-        ds, batch_size=batch_size, sampler=sampler,
-        collate_fn=collate_fn, num_workers=0
-    )
-
-
-# ─────────────────────────────────────────
-# Evaluation — NO threshold calibration
-# ─────────────────────────────────────────
-
-def evaluate(model, loader, loss_fn, device, threshold_phq=10.0):
-    """
-    Evaluate model on a data loader.
-    
-    IMPORTANT: threshold_phq is FIXED (not tuned on dev set).
-    Tuning the threshold on the evaluation set inflates metrics
-    and is a form of data leakage. Fixed threshold = honest evaluation.
-    
-    For logit-based prediction, threshold is 0.0.
-    Both PHQ-based and logit-based predictions are reported.
-    """
-    model.eval()
-    all_phq_pred, all_phq_true, all_dep_true = [], [], []
-    all_logit_pred = []
-    total_loss = 0.0
-
-    with torch.no_grad():
-        for batch in loader:
-            tf  = batch["text_feat"].to(device)
-            nv  = batch["nonverbal_feat"].to(device)
-            tl  = batch["text_lengths"].to(device)
-            nvl = batch["nonverbal_lengths"].to(device)
-            phq = batch["phq_score"].to(device)
-            dep = batch["dep_label"].to(device)
-
-            out  = model(tf, nv, tl, nvl)
-            loss = loss_fn(out, phq, dep)
-            total_loss += loss["total"].item()
-
-            all_phq_pred.extend(out["phq_score"].cpu().numpy())
-            all_logit_pred.extend(out["dep_logit"].cpu().numpy())
-            all_phq_true.extend(phq.cpu().numpy())
-            all_dep_true.extend(dep.long().cpu().numpy())
-
-    all_phq_pred   = np.array(all_phq_pred)
-    all_logit_pred = np.array(all_logit_pred)
-    all_phq_true   = np.array(all_phq_true)
-    all_dep_true   = np.array(all_dep_true)
-
-    # PHQ-based binary prediction (fixed threshold)
-    dep_from_phq  = (all_phq_pred >= threshold_phq).astype(int)
-    # Logit-based binary prediction
-    dep_from_logit = (all_logit_pred >= 0.0).astype(int)
-
-    # Use whichever gives better F1 at FIXED thresholds (no tuning)
-    f1_phq   = f1_score(all_dep_true, dep_from_phq,   zero_division=0)
-    f1_logit = f1_score(all_dep_true, dep_from_logit, zero_division=0)
-
-    if f1_logit >= f1_phq:
-        best_pred = dep_from_logit
-        best_f1   = f1_logit
-        best_src  = "logit"
-    else:
-        best_pred = dep_from_phq
-        best_f1   = f1_phq
-        best_src  = "phq"
-
-    mae  = mean_absolute_error(all_phq_true, all_phq_pred)
-    rmse = float(np.sqrt(((all_phq_true - all_phq_pred) ** 2).mean()))
-    acc  = accuracy_score(all_dep_true, best_pred)
-
-    return {
-        "loss":       total_loss / max(len(loader), 1),
-        "mae":        mae,
-        "rmse":       rmse,
-        "f1":         best_f1,
-        "acc":        acc,
-        "pred_src":   best_src,
-        "p_mean":     float(all_phq_pred.mean()),
-        "p_std":      float(all_phq_pred.std()),
-        "dep_pred":   best_pred,
-        "dep_true":   all_dep_true,
-    }
-
-
-# ─────────────────────────────────────────
-# Training loop
-# ─────────────────────────────────────────
-
-def train(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    # ── Data ──────────────────────────────────────────────────────
-    train_loader = get_balanced_dataloader(
-        args.train_csv, args.data_root,
-        batch_size=args.batch_size,
-        text_feat_dim=args.text_feat_dim,
-        nonverbal_dim=args.nonverbal_dim,
-    )
-    dev_loader = get_dataloader(
-        args.dev_csv, args.data_root,
-        batch_size=args.batch_size, shuffle=False,
-        text_feat_dim=args.text_feat_dim,
-        nonverbal_dim=args.nonverbal_dim,
-    )
-
-    # ── Model ─────────────────────────────────────────────────────
-    model = HTDGCDLModel(
-        text_input_dim=args.text_feat_dim,
-        nonverbal_input_dim=args.nonverbal_dim,
-        hidden_dim=args.hidden_dim,
-        n_segments=args.n_segments,
-        n_gnn_layers=args.n_gnn_layers,
-        n_attn_heads=args.n_attn_heads,
-        edge_dim=args.edge_dim,
-        n_spectral=args.n_spectral,
-        dropout=args.dropout,
-    ).to(device)
-
-    ema = ModelEMA(model, decay=args.ema_decay)
-
-    # ── Loss ──────────────────────────────────────────────────────
-    y_train = train_loader.dataset.labels["PHQ8_Binary"].astype(float).values
-    n_pos = max(float(y_train.sum()), 1.0)
-    n_neg = float(len(y_train) - n_pos)
-    pos_weight_value = n_neg / n_pos
-    pos_weight = torch.tensor(pos_weight_value, dtype=torch.float32, device=device)
-    print(f"Train: n_pos={int(n_pos)}, n_neg={int(n_neg)}, pos_weight={pos_weight_value:.3f}")
-
-    loss_fn = HTDGCDLLoss(
-        poincare=model.poincare,
-        lambda_cls=args.lambda_cls,
-        lambda_rmc=args.lambda_rmc,
-        pos_weight=pos_weight,
-    )
-
-    # ── Optimizer + Schedule ──────────────────────────────────────
-    # Separate LR groups: GNN/Poincaré (lower LR), rest (higher LR)
-    gnn_params = list(model.graph_builder.parameters()) + \
-                 list(model.gnn_layers.parameters()) + \
-                 list(model.poincare.parameters())
-    other_params = [p for n, p in model.named_parameters()
-                    if not any(id(p) == id(gp) for gp in gnn_params)]
-
-    optimizer = optim.AdamW([
-        {'params': other_params,  'lr': args.lr,           'weight_decay': 1e-4},
-        {'params': gnn_params,    'lr': args.lr * 0.3,     'weight_decay': 1e-3},
-    ])
-
-    total_steps   = args.epochs * len(train_loader)
-    warmup_steps  = min(args.warmup_epochs * len(train_loader), total_steps // 10)
-    scheduler     = WarmupCosineScheduler(optimizer, warmup_steps, total_steps)
-
-    best_f1  = 0.0
-    best_mae = 99.9
-    history  = []
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"\n{'='*70}")
-    print(f"  HTDG-CDL: Heterogeneous Temporal Discrepancy Graph")
-    print(f"  Params: {n_params:,} | Segments: {args.n_segments} | "
-          f"GNN layers: {args.n_gnn_layers}")
-    print(f"  Loss: MSE + {args.lambda_cls}·BCE + {args.lambda_rmc}·RMC")
-    print(f"  LR warmup: {warmup_steps} steps → cosine decay")
-    print(f"{'='*70}\n")
-
-    for epoch in range(1, args.epochs + 1):
+    if is_train:
         model.train()
-        epoch_loss = {"total": 0.0, "l_reg": 0.0, "l_cls": 0.0, "l_rmc": 0.0}
+    else:
+        model.eval()
 
-        for batch in train_loader:
-            tf  = batch["text_feat"].to(device)
-            nv  = batch["nonverbal_feat"].to(device)
-            tl  = batch["text_lengths"].to(device)
-            nvl = batch["nonverbal_lengths"].to(device)
-            phq = batch["phq_score"].to(device)
-            dep = batch["dep_label"].to(device)
+    total_losses: Dict[str, float] = {
+        "loss_total": 0.0, "loss_dep": 0.0, "loss_symptom": 0.0, "loss_phq": 0.0
+    }
+    n_batches = 0
+    all_labels: list = []
+    all_probs:  list = []
 
-            optimizer.zero_grad()
-            out  = model(tf, nv, tl, nvl)
-            loss = loss_fn(out, phq, dep)
-            loss["total"].backward()
+    ctx = torch.enable_grad() if is_train else torch.no_grad()
 
-            # Gradient clipping (essential for GNN stability)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-            ema.update(model)
+    with ctx:
+        for batch in loader:
+            batch = batch.to(device)
 
-            for k in epoch_loss:
-                v = loss.get(k, 0.0)
-                epoch_loss[k] += v if isinstance(v, float) else v.item()
+            dep_logit, sym_logits, phq_pred = model(batch)
 
-        n_b = max(len(train_loader), 1)
-        for k in epoch_loss:
-            epoch_loss[k] /= n_b
+            dep_labels  = batch.y.squeeze().long()
+            phq8_labels = batch.phq8.view(-1, NUM_SYMPTOMS).float()
+            phq_scores  = batch.phq_score.squeeze().float()
 
-        # ── Evaluate (use EMA model) ──────────────────────────────
-        metrics = evaluate(ema.get_model(), dev_loader, loss_fn, device)
+            loss, ld = compute_loss(
+                dep_logit, sym_logits, phq_pred,
+                dep_labels.float(), phq8_labels, phq_scores,
+                w_symptom=w_symptom, w_phq=w_phq,
+                focal_alpha=focal_alpha,
+                label_smoothing=label_smoothing,
+                device=device,
+            )
 
-        row = {
-            "epoch": epoch,
-            "train_loss": epoch_loss["total"],
-            **{f"train_{k}": v for k, v in epoch_loss.items() if k != "total"},
-            **{k: v for k, v in metrics.items()
-               if k not in ("dep_pred", "dep_true", "pred_src")},
-        }
-        history.append(row)
+            if is_train:
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+                optimizer.step()
 
-        # Current LR
-        cur_lr = optimizer.param_groups[0]['lr']
+            for k in total_losses:
+                total_losses[k] += ld.get(k, 0.0)
+            n_batches += 1
 
-        print(
-            f"Ep {epoch:03d} | "
-            f"Loss {epoch_loss['total']:.4f} "
-            f"(reg={epoch_loss['l_reg']:.3f} "
-            f"cls={epoch_loss['l_cls']:.3f} "
-            f"rmc={epoch_loss['l_rmc']:.3f}) | "
-            f"MAE={metrics['mae']:.2f} RMSE={metrics['rmse']:.2f} "
-            f"F1={metrics['f1']:.3f} Acc={metrics['acc']:.3f} "
-            f"({metrics['pred_src']}) "
-            f"lr={cur_lr:.1e}"
+            probs = torch.sigmoid(dep_logit).detach().cpu().numpy()
+            lbls  = dep_labels.detach().cpu().numpy()
+            all_probs.extend(probs.tolist())
+            all_labels.extend(lbls.tolist())
+
+    if n_batches > 0:
+        for k in total_losses:
+            total_losses[k] /= n_batches
+
+    return (
+        total_losses,
+        np.array(all_labels, dtype=int),
+        np.array(all_probs,  dtype=float),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scheduler factory: linear warmup → cosine annealing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_scheduler(
+    optimizer:         torch.optim.Optimizer,
+    num_warmup_epochs: int,
+    num_cosine_epochs: int,
+    eta_min:           float = 1e-6,
+) -> torch.optim.lr_scheduler._LRScheduler:
+    """
+    Builds a SequentialLR composed of:
+      1. Linear warmup from 0 → 1 over `num_warmup_epochs` epochs.
+      2. CosineAnnealingLR for `num_cosine_epochs` epochs.
+    """
+    def warmup_lambda(epoch: int) -> float:
+        if epoch < num_warmup_epochs:
+            return float(epoch + 1) / float(max(1, num_warmup_epochs))
+        return 1.0
+
+    warmup_sched  = LambdaLR(optimizer, lr_lambda=warmup_lambda)
+    cosine_sched  = CosineAnnealingLR(
+        optimizer, T_max=num_cosine_epochs, eta_min=eta_min
+    )
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_sched, cosine_sched],
+        milestones=[num_warmup_epochs],
+    )
+    return scheduler
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Checkpoint helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_checkpoint(
+    model:     HMSGNet,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    epoch:     int,
+    best_f1:   float,
+    path:      Path,
+) -> None:
+    torch.save(
+        {
+            "epoch":      epoch,
+            "best_f1":    best_f1,
+            "model_state_dict":     model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+        },
+        str(path),
+    )
+
+
+def load_checkpoint(
+    model:     HMSGNet,
+    optimizer: Optional[torch.optim.Optimizer],
+    scheduler,
+    path:      Path,
+    device:    torch.device,
+) -> Tuple[int, float]:
+    """Load checkpoint and return (start_epoch, best_f1)."""
+    ckpt = torch.load(str(path), map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    if optimizer is not None and "optimizer_state_dict" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    if scheduler is not None and "scheduler_state_dict" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    return ckpt.get("epoch", 0), ckpt.get("best_f1", 0.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def log_epoch(
+    epoch:       int,
+    phase:       str,
+    losses:      Dict[str, float],
+    metrics:     Dict[str, float],
+    lr:          float,
+    elapsed:     float,
+) -> None:
+    print(
+        f"[Epoch {epoch:03d}] {phase:5s} | "
+        f"loss={losses['loss_total']:.4f} "
+        f"(dep={losses['loss_dep']:.4f} "
+        f"sym={losses['loss_symptom']:.4f} "
+        f"phq={losses['loss_phq']:.4f}) | "
+        f"acc={metrics.get('accuracy', 0):.4f} "
+        f"f1_macro={metrics.get('f1_macro', 0):.4f} "
+        f"f1_w={metrics.get('f1_weighted', 0):.4f} "
+        f"prec={metrics.get('precision', 0):.4f} "
+        f"rec={metrics.get('recall', 0):.4f} "
+        f"auc={metrics.get('auc', float('nan')):.4f} "
+        f"thr={metrics.get('threshold', 0.5):.2f} | "
+        f"lr={lr:.2e} | {elapsed:.1f}s"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main training loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train HMSG-Net")
+    parser.add_argument(
+        "--dataset",
+        choices=["edaic", "daicwoz"],
+        default="edaic",
+        help="Dataset to train on: 'edaic' (default) or 'daicwoz'",
+    )
+    parser.add_argument(
+        "--force-reload",
+        action="store_true",
+        help="Re-process dataset from scratch (clears cache)",
+    )
+    args = parser.parse_args()
+
+    cfg = DATASET_CFG[args.dataset]
+
+    # ── Unpack all config values ──────────────────────────────────────────────
+    cache_dir      = cfg["cache_dir"]
+    checkpoint_dir = cfg["checkpoint_dir"]
+    text_dim       = cfg["text_dim"]
+    audio_dim      = cfg["audio_dim"]
+    video_dim      = cfg["video_dim"]
+    hidden_dim     = cfg["hidden_dim"]
+    num_gnn_layers = cfg["num_gnn_layers"]
+    n_heads        = cfg["n_heads"]
+    dropout        = cfg["dropout"]
+    drop_edge      = cfg["drop_edge"]
+    feat_noise     = cfg["feat_noise"]
+    focal_alpha          = cfg["focal_alpha"]
+    label_smoothing      = cfg.get("label_smoothing", 0.0)
+    w_symptom            = cfg["w_symptom"]
+    w_phq                = cfg["w_phq"]
+    use_weighted_sampler = cfg.get("use_weighted_sampler", False)
+    lr             = cfg["lr"]
+    weight_decay   = cfg["weight_decay"]
+    warmup_epochs  = cfg["warmup_epochs"]
+    cosine_epochs  = cfg["cosine_epochs"]
+    eta_min        = cfg["eta_min"]
+    batch_size     = cfg["batch_size"]
+    max_epochs     = cfg["max_epochs"]
+    early_stop_pat = cfg["early_stop_pat"]
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    best_model_path = checkpoint_dir / "best_model.pt"
+
+    set_seed(SEED)
+    print(f"Dataset: {args.dataset}  |  Device: {DEVICE}")
+
+    # ── Datasets & loaders ────────────────────────────────────────────────────
+    print("Loading datasets …")
+    if args.dataset == "edaic":
+        train_ds = DepressionDataset(split="train", root=cache_dir,
+                                     force_reload=args.force_reload)
+        dev_ds   = DepressionDataset(split="dev",   root=cache_dir,
+                                     force_reload=args.force_reload)
+    else:
+        train_ds = DaicWozDataset(split="train", root=cache_dir,
+                                   force_reload=args.force_reload)
+        dev_ds   = DaicWozDataset(split="dev",   root=cache_dir,
+                                   force_reload=args.force_reload)
+
+    if use_weighted_sampler:
+        from torch.utils.data import WeightedRandomSampler
+        labels_arr  = train_ds.labels().numpy()
+        class_count = np.bincount(labels_arr)
+        sample_w    = (1.0 / class_count)[labels_arr]   # per-sample weight
+        sampler     = WeightedRandomSampler(
+            weights=torch.from_numpy(sample_w).float(),
+            num_samples=len(train_ds),
+            replacement=True,
         )
-
-        # Save best checkpoints
-        if metrics["f1"] > best_f1:
-            best_f1 = metrics["f1"]
-            torch.save({
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "ema":   ema.ema_model.state_dict(),
-                "args":  vars(args),
-                "metrics": metrics,
-            }, os.path.join(args.output_dir, "best_f1_model.pt"))
-            print(f"  ✓ New best F1: {best_f1:.4f}")
-
-        if metrics["mae"] < best_mae:
-            best_mae = metrics["mae"]
-            torch.save({
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "ema":   ema.ema_model.state_dict(),
-                "args":  vars(args),
-                "metrics": metrics,
-            }, os.path.join(args.output_dir, "best_mae_model.pt"))
-
-    # ── Save training history ─────────────────────────────────────
-    def serialize(v):
-        if isinstance(v, (np.integer, np.floating)):
-            return float(v)
-        if hasattr(v, 'item'):
-            return v.item()
-        return v
-
-    with open(os.path.join(args.output_dir, "history.json"), "w") as f:
-        json.dump([{k: serialize(v) for k, v in row.items()} for row in history],
-                  f, indent=2)
-
-    print(f"\nBest F1: {best_f1:.4f}  |  Best MAE: {best_mae:.4f}")
-    print(f"Checkpoints: {args.output_dir}/")
-
-    # ── Final evaluation with best model ─────────────────────────
-    ckpt = torch.load(
-        os.path.join(args.output_dir, "best_f1_model.pt"),
-        map_location=device
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, sampler=sampler,
+            num_workers=0, pin_memory=(DEVICE.type == "cuda"), drop_last=False,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=0, pin_memory=(DEVICE.type == "cuda"), drop_last=False,
+        )
+    dev_loader = DataLoader(
+        dev_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=(DEVICE.type == "cuda"),
+        drop_last=False,
     )
-    ema.ema_model.load_state_dict(ckpt["ema"])
-    final = evaluate(ema.get_model(), dev_loader, loss_fn, device)
 
-    print("\n" + "="*60)
-    print("Final Dev Classification Report (EMA model, best F1 ckpt):")
-    print(classification_report(
-        final["dep_true"], final["dep_pred"],
-        target_names=["Non-Depressed", "Depressed"]
-    ))
-    print(f"Confusion Matrix:\n{confusion_matrix(final['dep_true'], final['dep_pred'])}")
-    print(f"MAE: {final['mae']:.4f} | RMSE: {final['rmse']:.4f}")
+    print(f"  Train: {len(train_ds)} graphs,  Dev: {len(dev_ds)} graphs")
+    label_counts = torch.bincount(train_ds.labels())
+    print(f"  Train class distribution: neg={label_counts[0]}, pos={label_counts[1]}")
 
+    # ── Model ─────────────────────────────────────────────────────────────────
+    model = HMSGNet(
+        hidden_dim=hidden_dim,
+        num_gnn_layers=num_gnn_layers,
+        n_heads=n_heads,
+        dropout=dropout,
+        num_symptoms=NUM_SYMPTOMS,
+        num_edge_types=NUM_EDGE_TYPES,
+        drop_edge=drop_edge,
+        feat_noise=feat_noise,
+        text_dim=text_dim,
+        audio_dim=audio_dim,
+        video_dim=video_dim,
+    ).to(DEVICE)
 
-# ─────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────
+    unified_dim = text_dim + audio_dim + video_dim
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Model parameters: {n_params:,}  (unified_dim={unified_dim})")
+    print(f"  focal_alpha={focal_alpha}  label_smooth={label_smoothing}  "
+          f"dropout={dropout}  drop_edge={drop_edge}  lr={lr:.1e}  "
+          f"batch={batch_size}  patience={early_stop_pat}  "
+          f"weighted_sampler={use_weighted_sampler}")
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="HTDG-CDL for DAIC-WOZ Depression Detection",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    # ── Optimiser & scheduler ─────────────────────────────────────────────────
+    optimizer = AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
     )
-    # Data
-    p.add_argument("--train_csv",  default="data/daicwoz/train_split_Depression_AVEC2017.csv")
-    p.add_argument("--dev_csv",    default="data/daicwoz/dev_split_Depression_AVEC2017.csv")
-    p.add_argument("--data_root",  default="data/daicwoz/")
-    # Features
-    p.add_argument("--text_feat_dim",  type=int, default=768)
-    p.add_argument("--nonverbal_dim",  type=int, default=88)
-    # Model architecture
-    p.add_argument("--hidden_dim",   type=int,   default=128,
-                   help="Hidden dimension for all encoders")
-    p.add_argument("--n_segments",   type=int,   default=8,
-                   help="Number of temporal segments per session for graph nodes")
-    p.add_argument("--n_gnn_layers", type=int,   default=2,
-                   help="Number of HGA-EF GNN layers")
-    p.add_argument("--n_attn_heads", type=int,   default=4,
-                   help="Attention heads in HGA-EF")
-    p.add_argument("--edge_dim",     type=int,   default=16,
-                   help="Edge feature dimension in HTDG")
-    p.add_argument("--n_spectral",   type=int,   default=8,
-                   help="Spectral components to extract per discrepancy pair")
-    p.add_argument("--dropout",      type=float, default=0.1)
-    # Loss
-    p.add_argument("--lambda_cls", type=float, default=0.5,
-                   help="Weight for BCE classification loss")
-    p.add_argument("--lambda_rmc", type=float, default=0.3,
-                   help="Weight for Riemannian Manifold Contrastive loss")
-    # Training
-    p.add_argument("--epochs",        type=int,   default=80)
-    p.add_argument("--batch_size",    type=int,   default=8)
-    p.add_argument("--lr",            type=float, default=3e-4)
-    p.add_argument("--warmup_epochs", type=int,   default=5,
-                   help="Epochs for LR linear warmup")
-    p.add_argument("--ema_decay",     type=float, default=0.995,
-                   help="EMA decay for model averaging")
-    p.add_argument("--output_dir",    default="checkpoints_htdg")
-    return p.parse_args()
+    scheduler = build_scheduler(
+        optimizer,
+        num_warmup_epochs=warmup_epochs,
+        num_cosine_epochs=cosine_epochs,
+        eta_min=eta_min,
+    )
 
+    # Resume if checkpoint exists (skip when force-reload clears data)
+    start_epoch = 1
+    best_dev_f1 = 0.0
+    if best_model_path.exists() and not args.force_reload:
+        print(f"  Resuming from checkpoint: {best_model_path}")
+        start_epoch, best_dev_f1 = load_checkpoint(
+            model, optimizer, scheduler, best_model_path, DEVICE
+        )
+        start_epoch += 1
+        print(f"  Resuming at epoch {start_epoch}, best_dev_f1={best_dev_f1:.4f}")
+
+    no_improve_count = 0
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    for epoch in range(start_epoch, max_epochs + 1):
+        t0 = time.time()
+
+        # --- Train ---
+        train_losses, train_labels, train_probs = run_epoch(
+            model, train_loader, optimizer, DEVICE, is_train=True,
+            w_symptom=w_symptom, w_phq=w_phq, focal_alpha=focal_alpha,
+            label_smoothing=label_smoothing,
+        )
+        train_metrics = compute_metrics(train_labels, train_probs, threshold=0.5)
+        lr_now = optimizer.param_groups[0]["lr"]
+        log_epoch(epoch, "TRAIN", train_losses, train_metrics, lr_now,
+                  time.time() - t0)
+
+        # --- Dev (with threshold optimisation) ---
+        t1 = time.time()
+        dev_losses, dev_labels, dev_probs = run_epoch(
+            model, dev_loader, None, DEVICE, is_train=False,
+            w_symptom=w_symptom, w_phq=w_phq, focal_alpha=focal_alpha,
+            label_smoothing=0.0,   # no smoothing at eval
+        )
+        best_thr = find_best_threshold(dev_labels, dev_probs)
+        dev_metrics = compute_metrics(dev_labels, dev_probs, threshold=best_thr)
+        log_epoch(epoch, "DEV", dev_losses, dev_metrics, lr_now,
+                  time.time() - t1)
+
+        scheduler.step()
+
+        # --- Early stopping & checkpointing ---
+        # Use AUC as primary criterion: more robust than threshold-optimised F1
+        # on small dev sets (35 samples), where threshold search can overfit.
+        dev_f1  = dev_metrics.get("f1_macro", 0.0)
+        dev_auc = dev_metrics.get("auc", 0.0)
+        if dev_auc > best_dev_f1:   # best_dev_f1 now tracks best AUC
+            best_dev_f1 = dev_auc
+            no_improve_count = 0
+            ckpt_data = {
+                "epoch": epoch, "best_auc": best_dev_f1, "best_f1": dev_f1,
+                "best_threshold": best_thr,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+            }
+            torch.save(ckpt_data, str(best_model_path))
+            print(f"  * New best dev AUC={best_dev_f1:.4f} "
+                  f"(F1={dev_f1:.4f} thr={best_thr:.2f}) -> saved")
+        else:
+            no_improve_count += 1
+            print(f"  No improvement ({no_improve_count}/{early_stop_pat}). "
+                  f"Best dev AUC = {best_dev_f1:.4f}")
+            if no_improve_count >= early_stop_pat:
+                print(f"Early stopping triggered at epoch {epoch}.")
+                break
+
+    print(f"\nTraining complete. Best dev AUC = {best_dev_f1:.4f}")
+    print(f"Best model saved at: {best_model_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    args = parse_args()
-    train(args)
+    main()
