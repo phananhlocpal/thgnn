@@ -136,6 +136,7 @@ echo ================================
 echo   SETUP SUCCESS
 echo ================================
 echo Activate with:
+echo    Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 echo     .venv\Scripts\activate
 
 exit /b 0

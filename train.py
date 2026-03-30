@@ -51,10 +51,9 @@ DATASET_CFG = {
         # Paths
         "cache_dir":      "C:/Users/ezycloudx-admin/Desktop/thgnn/cache",
         "checkpoint_dir": Path("C:/Users/ezycloudx-admin/Desktop/thgnn/checkpoints"),
-        # Feature dims
+        # Feature dims (2-modal: BERT text + wav2vec audio)
         "text_dim":  768,
-        "audio_dim": 46,    # 23 eGeMAPS × mean+std
-        "video_dim": 98,    # 49 OpenFace × mean+std
+        "audio_dim": 768,   # wav2vec2
         # Model
         "hidden_dim":      256,
         "num_gnn_layers":  3,
@@ -82,26 +81,24 @@ DATASET_CFG = {
         # Paths
         "cache_dir":      "C:/Users/ezycloudx-admin/Desktop/thgnn/cache_daicwoz",
         "checkpoint_dir": Path("C:/Users/ezycloudx-admin/Desktop/thgnn/checkpoints_daicwoz"),
-        # Feature dims
+        # Feature dims (2-modal: BERT text + wav2vec audio)
         "text_dim":  768,
-        "audio_dim": 148,   # 74 COVAREP × mean+std
-        "video_dim": 40,    # 20 CLNF_AUs × mean+std
-        # Model — restore to 256/3-layer (proven to reach F1=0.68);
-        # 128-dim + dropout=0.5 killed signal (model output p≈0.5 everywhere)
+        "audio_dim": 768,   # wav2vec2
+        # Model
         "hidden_dim":      256,
         "num_gnn_layers":  3,
         "n_heads":         4,
-        "dropout":         0.45,   # increased to delay memorisation
-        "drop_edge":       0.20,   # increased: model memorises from ep65 with 0.15
+        "dropout":         0.45,
+        "drop_edge":       0.20,
         "feat_noise":      0.03,
-        # Loss — focal alone handles imbalance; DO NOT add weighted_sampler on top
-        "focal_alpha":     0.72,   # nudged up (28% positive)
-        "label_smoothing": 0.0,    # removed: conflicted with focal loss gradient
-        "w_symptom":       0.05,   # keep low: PHQ8 per-item labels noisy
+        # Loss
+        "focal_alpha":     0.72,
+        "label_smoothing": 0.0,
+        "w_symptom":       0.05,
         "w_phq":           0.05,
         # Optimiser
         "lr":              2e-4,
-        "weight_decay":    5e-4,   # moderate L2 (compromise 2e-4 ↔ 1e-3)
+        "weight_decay":    5e-4,
         # Scheduler
         "warmup_epochs":   8,
         "cosine_epochs":   300,
@@ -110,7 +107,7 @@ DATASET_CFG = {
         "batch_size":      8,
         "max_epochs":      300,
         "early_stop_pat":  50,
-        "use_weighted_sampler": False,   # disabled: double-compensates with focal loss
+        "use_weighted_sampler": False,
     },
 }
 
@@ -388,7 +385,6 @@ def main() -> None:
     checkpoint_dir = cfg["checkpoint_dir"]
     text_dim       = cfg["text_dim"]
     audio_dim      = cfg["audio_dim"]
-    video_dim      = cfg["video_dim"]
     hidden_dim     = cfg["hidden_dim"]
     num_gnn_layers = cfg["num_gnn_layers"]
     n_heads        = cfg["n_heads"]
@@ -472,10 +468,9 @@ def main() -> None:
         feat_noise=feat_noise,
         text_dim=text_dim,
         audio_dim=audio_dim,
-        video_dim=video_dim,
     ).to(DEVICE)
 
-    unified_dim = text_dim + audio_dim + video_dim
+    unified_dim = text_dim + audio_dim
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Model parameters: {n_params:,}  (unified_dim={unified_dim})")
     print(f"  focal_alpha={focal_alpha}  label_smooth={label_smoothing}  "
