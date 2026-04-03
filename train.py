@@ -49,8 +49,8 @@ SEED = 42
 DATASET_CFG = {
     "edaic": {
         # Paths
-        "cache_dir":      "C:/Users/ezycloudx-admin/Desktop/thgnn/cache",
-        "checkpoint_dir": Path("C:/Users/ezycloudx-admin/Desktop/thgnn/checkpoints"),
+        "cache_dir":      "C:/Users/Administrator/Desktop/thgnn/cache",
+        "checkpoint_dir": Path("C:/Users/Administrator/Desktop/thgnn/checkpoints"),
         # Feature dims (2-modal: BERT text + wav2vec audio)
         "text_dim":  768,
         "audio_dim": 768,   # wav2vec2
@@ -79,41 +79,41 @@ DATASET_CFG = {
     },
     "daicwoz": {
         # Paths
-        "cache_dir":      "C:/Users/ezycloudx-admin/Desktop/thgnn/cache_daicwoz",
-        "checkpoint_dir": Path("C:/Users/ezycloudx-admin/Desktop/thgnn/checkpoints_daicwoz"),
-        # Feature dims (2-modal: BERT text + wav2vec audio)
-        "text_dim":  768,
-        "audio_dim": 768,   # wav2vec2
-        # Model
-        "hidden_dim":      256,
-        "num_gnn_layers":  3,
-        "n_heads":         4,
-        "dropout":         0.45,
-        "drop_edge":       0.20,
-        "feat_noise":      0.03,
-        # Loss
-        "focal_alpha":     0.72,
-        "label_smoothing": 0.0,
-        "w_symptom":       0.05,
-        "w_phq":           0.05,
-        # Optimiser
-        "lr":              2e-4,
-        "weight_decay":    5e-4,
-        # Scheduler
-        "warmup_epochs":   8,
+        "cache_dir":      "C:/Users/Administrator/Desktop/thgnn/cache_daicwoz",
+        "checkpoint_dir": Path("C:/Users/Administrator/Desktop/thgnn/checkpoints_daicwoz"),
+        # Feature dims — BERT(768) + prosodic(8) per modality
+        "text_dim":  776,
+        "audio_dim": 776,
+        # Tiny model: 107 samples cannot support large capacity
+        "hidden_dim":      64,
+        "num_gnn_layers":  1,
+        "n_heads":         2,      # head_dim = 32
+        "dropout":         0.70,
+        "drop_edge":       0.40,
+        "feat_noise":      0.05,
+        # Loss — pure dep focal, aux losses add noise with this few samples
+        "focal_alpha":     0.75,
+        "label_smoothing": 0.05,
+        "w_symptom":       0.0,
+        "w_phq":           0.0,
+        # Optimiser — very low constant LR avoids the epoch-3 overshoot pattern
+        "lr":              5e-5,
+        "weight_decay":    5e-3,
+        # Scheduler — 1-epoch warmup (lambda(0)=1.0, effectively no ramp), gentle cosine
+        "warmup_epochs":   1,
         "cosine_epochs":   300,
-        "eta_min":         1e-6,
+        "eta_min":         1e-7,
         # Training loop
         "batch_size":      8,
         "max_epochs":      300,
-        "early_stop_pat":  50,
-        "use_weighted_sampler": False,
+        "early_stop_pat":  60,
+        "use_weighted_sampler": True,
     },
 }
 
 # Kept for backward-compat reference; actual values come from DATASET_CFG
 NUM_SYMPTOMS   = 8
-NUM_EDGE_TYPES = 9
+NUM_EDGE_TYPES = 4   # dataset builds exactly 4 edge types: T→T, A→A, T→A, A→T
 MAX_GRAD_NORM  = 1.0
 
 # Device
@@ -145,7 +145,7 @@ def find_best_threshold(labels: np.ndarray, probs: np.ndarray) -> float:
     (e.g. 0.10 that predicts nearly all positive).
     """
     best_thr, best_f1 = 0.5, 0.0
-    for thr in np.arange(0.30, 0.71, 0.02):
+    for thr in np.arange(0.20, 0.81, 0.02):
         preds = (probs >= thr).astype(int)
         f1 = f1_score(labels, preds, average="macro", zero_division=0)
         if f1 > best_f1:
