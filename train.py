@@ -31,9 +31,11 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -123,6 +125,40 @@ NUM_EDGE_TYPES = 4
 MAX_GRAD_NORM  = 1.0
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Output teeing
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for stream in self._streams:
+            stream.write(data)
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
+
+@contextmanager
+def tee_output(log_path: Path):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        sys.stdout = _Tee(original_stdout, log_file)
+        sys.stderr = _Tee(original_stderr, log_file)
+        try:
+            yield
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -649,6 +685,9 @@ def main() -> None:
 
     cfg = DATASET_CFG[args.dataset]
 
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    seed_label = "multi" if args.multi_seed else str(args.seeds[0] if args.seeds else BASE_SEED)
+
     log_dir = (
         Path(args.log_dir)
         if args.log_dir
@@ -656,29 +695,33 @@ def main() -> None:
     )
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Dataset      : {args.dataset}")
-    print(f"Context mode : {args.context_mode}")
-    print(f"Multi-seed   : {args.multi_seed}")
-    print(f"Device       : {DEVICE}")
-    print(f"Log dir      : {log_dir}")
+    txt_log_path = log_dir / f"train_{args.dataset}_ctx_{args.context_mode}_seed_{seed_label}_{timestamp}.txt"
 
-    if args.multi_seed:
-        seeds = args.seeds if args.seeds else MULTI_SEEDS
-        run_multi_seed(cfg, seeds, args.dataset, args.context_mode, log_dir)
-        print_shortcut_ablation_reminder()
-    else:
-        seed     = args.seeds[0] if args.seeds else BASE_SEED
-        log_path = log_dir / f"run_ctx_{args.context_mode}_seed_{seed}.json"
-        metrics  = train_one_seed(
-            cfg, seed, args.dataset, args.context_mode, log_path
-        )
-        print(f"\nFinal best dev metrics:")
-        for k, v in sorted(metrics.items()):
-            if isinstance(v, float):
-                print(f"  {k:<20}: {v:.4f}")
-            else:
-                print(f"  {k:<20}: {v}")
-        print_shortcut_ablation_reminder()
+    with tee_output(txt_log_path):
+        print(f"Dataset      : {args.dataset}")
+        print(f"Context mode : {args.context_mode}")
+        print(f"Multi-seed   : {args.multi_seed}")
+        print(f"Device       : {DEVICE}")
+        print(f"Log dir      : {log_dir}")
+        print(f"TXT log      : {txt_log_path}")
+
+        if args.multi_seed:
+            seeds = args.seeds if args.seeds else MULTI_SEEDS
+            run_multi_seed(cfg, seeds, args.dataset, args.context_mode, log_dir)
+            print_shortcut_ablation_reminder()
+        else:
+            seed     = args.seeds[0] if args.seeds else BASE_SEED
+            log_path = log_dir / f"run_ctx_{args.context_mode}_seed_{seed}.json"
+            metrics  = train_one_seed(
+                cfg, seed, args.dataset, args.context_mode, log_path
+            )
+            print(f"\nFinal best dev metrics:")
+            for k, v in sorted(metrics.items()):
+                if isinstance(v, float):
+                    print(f"  {k:<20}: {v:.4f}")
+                else:
+                    print(f"  {k:<20}: {v}")
+            print_shortcut_ablation_reminder()
 
 
 if __name__ == "__main__":

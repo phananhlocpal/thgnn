@@ -1,8 +1,13 @@
-# Bước 1: Extract cả 3 context modes
-python extract_bert_v3_fixed.py --split_csv train.csv --all_modes
+# Bước 1: Extract BERT cả 3 context modes
+python extract_bert_daicwoz.py --split_csv daicwoz/train_split_Depression_AVEC2017.csv --all_modes
+python extract_bert_daicwoz.py --split_csv daicwoz/dev_split_Depression_AVEC2017.csv --all_modes
+python extract_bert_daicwoz.py --split_csv daicwoz/test_split_Depression_AVEC2017.csv --all_modes
 
+python extract_wav2vec_daicwoz.py --split_csv daicwoz/train_split_Depression_AVEC2017.csv --fp16 --batch_size 32
+python extract_wav2vec_daicwoz.py --split_csv daicwoz/dev_split_Depression_AVEC2017.csv --fp16 --batch_size 32
+python extract_wav2vec_daicwoz.py --split_csv daicwoz/test_split_Depression_AVEC2017.csv --fp16 --batch_size 32
 # Bước 2: Train multi-seed với mode "none" (anti-shortcut)
-python train.py --dataset daicwoz --context_mode none --multi_seed
+python train.py --dataset daicwoz --context_mode none --multi_seed 
 
 # Bước 3: Train multi-seed với mode "truncated" để so sánh
 python train.py --dataset daicwoz --context_mode truncated --multi_seed
