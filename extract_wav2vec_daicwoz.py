@@ -1,29 +1,30 @@
 """
-extract_wav2vec_v2_optimized.py — Extract wav2vec2 audio embeddings, tối ưu tốc độ.
+extract_wav2vec_v3.py — Extract audio embeddings từ DAIC-WOZ (v3, full rewrite).
 
-Tối ưu so với v2_fixed:
-  1. [PERF-CRITICAL] Batched inference: gom nhiều segments vào 1 forward pass
-     thay vì 1 forward pass / group. Giảm overhead GPU transfer ~30x.
-  2. [PERF-MAJOR] Duration-sorted batching: sort groups theo duration trước khi
-     batch → segments cùng batch có length gần nhau → ít padding waste (~40%).
-  3. [PERF-MAJOR] FP16 autocast (GPU): forward pass ở half precision,
-     ~2x throughput, negligible quality loss cho mean-pooled embeddings.
-  4. [PERF] Prefetch: dùng ThreadPoolExecutor để load & resample audio của
-     participant tiếp theo trong khi GPU đang embed participant hiện tại.
-  5. [PERF] Max duration cap: segments >30s được cắt thành 30s
-     (phần cuối thường là silence), tránh OOM và giảm padding.
+Fixes vs v2_optimized
+─────────────────────
+[FIX-CRITICAL] Switch từ wav2vec2-base-960h (ASR fine-tuned) sang WavLM
+  (microsoft/wavlm-base-plus, self-supervised). ASR fine-tuning đẩy model
+  focus vào phoneme identity, mất prosodic/para-linguistic features — chính
+  xác những gì depression detection cần. WavLM được trained với masked
+  speech prediction + denoising → robust hơn với clinical speech quality.
 
-Estimated speedup: ~10-60x tuỳ GPU/CPU.
-  - GPU + batch(32) + fp16: ~0.5min cho full DAIC-WOZ (vs ~29min trước)
-  - CPU + batch(8):         ~2h (vs ~6.5h trước)
+[FIX-CRITICAL] Adaptive VAD threshold: thay vì fixed 0.01, tính per-segment
+  noise floor từ silent prefix/suffix của recording rồi set threshold =
+  noise_floor * 3.0. Giảm confounding giữa recording quality và speech ratio.
 
-Usage giống v2_fixed, thêm options:
-  python extract_wav2vec_v2_optimized.py \\
-      --split_csv daicwoz/train_split_Depression_AVEC2017.csv \\
-      --batch_size 16 \\
-      --fp16 \\
-      --max_segment_sec 30.0 \\
-      --num_prefetch_workers 2
+[FIX-MAJOR] Minimum speech quality gate: skip embedding nếu speech_ratio < 0.1
+  sau VAD (segment chủ yếu là silence). Trước đây những segments này tạo
+  ra garbage embeddings (mean-pool of silence frames).
+
+[FIX-MAJOR] Layer-wise feature extraction: WavLM có 12 transformer layers,
+  mỗi layer encode thông tin khác nhau. Dùng weighted average của layers 6-11
+  (upper-mid layers capture prosody tốt hơn last layer cho depression tasks).
+
+[KEEP] Batched inference, FP16, duration-sorted batching, prefetch.
+[KEEP] Prosody features (pitch, energy) từ librosa.
+[KEEP] Silence/pause features từ energy VAD.
+[KEEP] Sync với text meta groups (groups từ BERT extractor).
 """
 
 import argparse
@@ -32,23 +33,24 @@ import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 import pandas as pd
 import torch
 import torchaudio
-from transformers import Wav2Vec2Model, Wav2Vec2Processor
+from transformers import AutoProcessor, WavLMModel
 
 try:
     import librosa
     HAS_LIBROSA = True
 except ImportError:
     HAS_LIBROSA = False
+    logging.warning("librosa not installed — prosody features will be zeros.")
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Logging
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -56,27 +58,37 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Constants
-# ──────────────────────────────────────────────────────────────
-TARGET_SR = 16_000
-EMBED_DIM = 768
-MIN_DURATION = 0.1
-DEFAULT_MERGE_GAP_SEC = 2.0
-MAX_SEGMENT_SEC = 30.0
-VAD_ENERGY_THRESHOLD = 0.01
-VAD_FRAME_SEC = 0.02
+# ─────────────────────────────────────────────────────────────────────────────
+TARGET_SR            = 16_000
+EMBED_DIM            = 768
+MIN_DURATION_SEC     = 0.1
+MAX_SEGMENT_SEC      = 30.0
+DEFAULT_MERGE_GAP    = 2.0
 
-_TAG_RE = re.compile(r"<[^>]+>")
+# WavLM layer selection: layers 6-11 (0-indexed) — upper-mid layers
+# proven better for paralinguistic tasks vs last layer
+WAVLM_LAYER_START    = 6
+WAVLM_LAYER_END      = 12   # exclusive → layers [6,7,8,9,10,11]
+
+# Adaptive VAD
+VAD_FRAME_SEC        = 0.02
+VAD_NOISE_MULTIPLIER = 3.0   # threshold = noise_floor * 3.0
+VAD_NOISE_PREFIX_SEC = 0.5   # use first 0.5s to estimate noise floor
+MIN_SPEECH_RATIO     = 0.10  # below this → skip embedding (silence segment)
+MIN_PAUSE_DUR_SEC    = 0.15  # pauses shorter than this ignored
+
 _SYNC_RE = re.compile(r"^\s*<\s*synch?\s*>\s*$", re.IGNORECASE)
 
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Audio I/O
-# ──────────────────────────────────────────────────────────────
-def load_audio(audio_path: str) -> tuple[torch.Tensor, int]:
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_audio(audio_path: str) -> tuple:
     waveform, sr = torchaudio.load(audio_path)
-    return waveform[0], sr
+    return waveform[0], sr  # mono
 
 
 def resample_if_needed(waveform: torch.Tensor, sr: int) -> torch.Tensor:
@@ -87,10 +99,11 @@ def resample_if_needed(waveform: torch.Tensor, sr: int) -> torch.Tensor:
 
 
 def slice_segment(
-    waveform: torch.Tensor, t_start: float, t_stop: float,
-    max_sec: float = MAX_SEGMENT_SEC,
+    waveform: torch.Tensor,
+    t_start:  float,
+    t_stop:   float,
+    max_sec:  float = MAX_SEGMENT_SEC,
 ) -> torch.Tensor:
-    # Cap duration to max_sec to avoid OOM and reduce padding
     if t_stop - t_start > max_sec:
         t_stop = t_start + max_sec
     i_start = max(0, int(t_start * TARGET_SR))
@@ -98,189 +111,212 @@ def slice_segment(
     return waveform[i_start:i_stop]
 
 
-# ──────────────────────────────────────────────────────────────
-# Silence features
-# ──────────────────────────────────────────────────────────────
-def compute_silence_features(segment: torch.Tensor) -> dict:
-    wav = segment.numpy()
-    frame_len = max(1, int(VAD_FRAME_SEC * TARGET_SR))
-    n_frames  = len(wav) // frame_len
+# ─────────────────────────────────────────────────────────────────────────────
+# Adaptive VAD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def estimate_noise_floor(waveform: torch.Tensor) -> float:
+    """
+    Estimate noise floor from the first VAD_NOISE_PREFIX_SEC of the segment.
+    Uses RMS energy of the prefix as noise floor estimate.
+    Falls back to a fixed low value if prefix is too short.
+    """
+    n_prefix = int(VAD_NOISE_PREFIX_SEC * TARGET_SR)
+    if len(waveform) < n_prefix or n_prefix < 160:
+        return 0.005   # fallback
+
+    prefix = waveform[:n_prefix].numpy()
+    rms    = float(np.sqrt(np.mean(prefix ** 2)))
+    # Clip to avoid pathological cases
+    return float(np.clip(rms, 1e-5, 0.1))
+
+
+def compute_silence_features(
+    segment:         torch.Tensor,
+    noise_floor:     float,
+) -> dict:
+    """
+    Per-segment pause/silence features using adaptive VAD threshold.
+    threshold = noise_floor * VAD_NOISE_MULTIPLIER
+    """
+    wav        = segment.numpy()
+    frame_len  = max(1, int(VAD_FRAME_SEC * TARGET_SR))
+    n_frames   = len(wav) // frame_len
 
     if n_frames == 0:
-        return {"mean_pause_sec": 0.0, "max_pause_sec": 0.0,
-                "n_pauses": 0, "speech_ratio": 0.0}
+        return {
+            "mean_pause_sec": 0.0, "max_pause_sec": 0.0,
+            "n_pauses": 0, "speech_ratio": 0.0,
+        }
 
-    frames = wav[:n_frames * frame_len].reshape(n_frames, frame_len)
-    rms = np.sqrt((frames ** 2).mean(axis=1))
-    rms_max = rms.max()
-    rms_norm = rms / rms_max if rms_max > 0 else rms
+    frames    = wav[:n_frames * frame_len].reshape(n_frames, frame_len)
+    rms       = np.sqrt((frames ** 2).mean(axis=1))
+    threshold = noise_floor * VAD_NOISE_MULTIPLIER
 
-    is_silence = rms_norm < VAD_ENERGY_THRESHOLD
+    is_silence   = rms < threshold
     speech_ratio = float((~is_silence).mean())
 
     pauses = []
-    in_pause = False
-    pause_start = 0
+    in_pause, pause_start = False, 0
     for i, sil in enumerate(is_silence):
         if sil and not in_pause:
-            in_pause = True
-            pause_start = i
+            in_pause, pause_start = True, i
         elif not sil and in_pause:
             in_pause = False
             pauses.append((i - pause_start) * VAD_FRAME_SEC)
     if in_pause:
         pauses.append((n_frames - pause_start) * VAD_FRAME_SEC)
 
-    pauses = [p for p in pauses if p >= 0.15]
+    pauses = [p for p in pauses if p >= MIN_PAUSE_DUR_SEC]
 
     return {
-        "mean_pause_sec": round(float(np.mean(pauses)), 3) if pauses else 0.0,
-        "max_pause_sec" : round(float(np.max(pauses)), 3) if pauses else 0.0,
-        "n_pauses"      : len(pauses),
-        "speech_ratio"  : round(speech_ratio, 3),
+        "mean_pause_sec" : round(float(np.mean(pauses)), 3) if pauses else 0.0,
+        "max_pause_sec"  : round(float(np.max(pauses)),  3) if pauses else 0.0,
+        "n_pauses"       : len(pauses),
+        "speech_ratio"   : round(speech_ratio, 3),
     }
 
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Prosody features
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
 def compute_prosody_features(segment: torch.Tensor) -> dict:
-    empty = {"mean_pitch_hz": -1.0, "std_pitch_hz": -1.0,
-             "mean_energy": -1.0, "std_energy": -1.0}
+    empty = {
+        "mean_pitch_hz": -1.0, "std_pitch_hz": -1.0,
+        "mean_energy": -1.0,   "std_energy": -1.0,
+    }
     if not HAS_LIBROSA or len(segment) < TARGET_SR * 0.1:
         return empty
     wav = segment.numpy().astype(np.float32)
     try:
         f0, voiced_flag, _ = librosa.pyin(
-            wav, fmin=librosa.note_to_hz("C2"),
-            fmax=librosa.note_to_hz("C7"), sr=TARGET_SR,
+            wav,
+            fmin=librosa.note_to_hz("C2"),
+            fmax=librosa.note_to_hz("C7"),
+            sr=TARGET_SR,
         )
-        voiced_f0 = f0[voiced_flag] if voiced_flag is not None else f0[~np.isnan(f0)]
+        voiced_f0  = f0[voiced_flag] if voiced_flag is not None else f0[~np.isnan(f0)]
         mean_pitch = float(np.nanmean(voiced_f0)) if len(voiced_f0) > 0 else 0.0
         std_pitch  = float(np.nanstd(voiced_f0))  if len(voiced_f0) > 0 else 0.0
-        rms = librosa.feature.rms(y=wav, frame_length=512, hop_length=256)[0]
+        rms        = librosa.feature.rms(y=wav, frame_length=512, hop_length=256)[0]
         return {
             "mean_pitch_hz": round(mean_pitch, 2),
-            "std_pitch_hz" : round(std_pitch, 2),
+            "std_pitch_hz" : round(std_pitch,  2),
             "mean_energy"  : round(float(np.mean(rms)), 5),
-            "std_energy"   : round(float(np.std(rms)), 5),
+            "std_energy"   : round(float(np.std(rms)),  5),
         }
     except Exception as e:
         log.debug(f"Prosody error: {e}")
         return empty
 
 
-# ──────────────────────────────────────────────────────────────
-# BATCHED wav2vec2 embedding (KEY OPTIMIZATION)
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# WavLM layer-weighted embedding (KEY FIX)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def embed_segments_batched(
-    segments: list[torch.Tensor],
-    processor: Wav2Vec2Processor,
-    model: Wav2Vec2Model,
-    device: torch.device,
+    segments:   List[torch.Tensor],
+    processor,
+    model:      WavLMModel,
+    device:     torch.device,
     batch_size: int = 16,
-    use_fp16: bool = False,
-) -> list[np.ndarray]:
+    use_fp16:   bool = False,
+) -> List[np.ndarray]:
     """
-    Embed a list of 1-D audio segments in batched mode.
+    Batch-embed segments using WavLM with weighted average of layers 6-11.
 
-    Key optimizations:
-      - Sort by duration → batch similar lengths → less padding waste
-      - Single padded forward pass per batch instead of per-segment
-      - Optional fp16 autocast for ~2x throughput on GPU
-      - Bulk CPU→GPU transfer
-
-    Returns list of (768,) numpy arrays in ORIGINAL order.
+    Key difference from v2: instead of taking last_hidden_state, we
+    take hidden states from WAVLM_LAYER_START to WAVLM_LAYER_END,
+    compute uniform mean (learnable weighting is in the dataset/model).
+    Upper-mid layers of WavLM capture prosodic and speaker-level features
+    better than the final layer.
     """
     if not segments:
         return []
 
     n = len(segments)
-
-    # Sort indices by segment length (ascending) for efficient padding
-    lengths = [len(s) for s in segments]
-    sorted_indices = sorted(range(n), key=lambda i: lengths[i])
-
-    all_embeddings = [None] * n  # Will fill in original order
+    sorted_indices = sorted(range(n), key=lambda i: len(segments[i]))
+    all_embeddings: List[Optional[np.ndarray]] = [None] * n
     model.eval()
-
     use_autocast = use_fp16 and device.type == "cuda"
 
     with torch.no_grad():
         for batch_start in range(0, n, batch_size):
-            batch_indices = sorted_indices[batch_start : batch_start + batch_size]
-            batch_segments = [segments[i].numpy() for i in batch_indices]
+            batch_idx = sorted_indices[batch_start: batch_start + batch_size]
+            batch_np  = [segments[i].numpy() for i in batch_idx]
 
-            # Processor handles padding for variable-length inputs
             inputs = processor(
-                batch_segments,
+                batch_np,
                 sampling_rate=TARGET_SR,
                 return_tensors="pt",
-                padding=True,   # Pad to longest in batch
+                padding=True,
             )
-
-            input_values = inputs["input_values"].to(device)
-
-            # Build attention mask: 1 where real audio, 0 where padded
-            # processor pads with 0.0, so we use the padding info
-            attention_mask = None
-            if "attention_mask" in inputs:
-                attention_mask = inputs["attention_mask"].to(device)
+            input_values  = inputs["input_values"].to(device)
+            attention_mask = inputs.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
 
             if use_autocast:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     outputs = model(
                         input_values,
                         attention_mask=attention_mask,
+                        output_hidden_states=True,
                     )
-                hidden = outputs.last_hidden_state.float()  # Back to fp32 for pooling
+                hidden_states = [h.float() for h in outputs.hidden_states]
             else:
                 outputs = model(
                     input_values,
                     attention_mask=attention_mask,
+                    output_hidden_states=True,
                 )
-                hidden = outputs.last_hidden_state  # (B, T, 768)
+                hidden_states = list(outputs.hidden_states)
 
-            # Mean pooling with attention mask
+            # FIX: use layers 6-11 (upper-mid), uniform mean
+            selected_layers = hidden_states[WAVLM_LAYER_START:WAVLM_LAYER_END]
+            stacked = torch.stack(selected_layers, dim=0)   # (K, B, T, H)
+            merged  = stacked.mean(dim=0)                   # (B, T, H)
+
+            # Mean-pool over time with attention mask
             if attention_mask is not None:
-                mask = attention_mask.unsqueeze(-1).float()  # (B, T, 1)
-                pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+                mask   = attention_mask.unsqueeze(-1).float()
+                pooled = (merged * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
             else:
-                pooled = hidden.mean(dim=1)
+                pooled = merged.mean(dim=1)
 
             batch_embs = pooled.cpu().numpy().astype(np.float32)
-
-            for j, orig_idx in enumerate(batch_indices):
+            for j, orig_idx in enumerate(batch_idx):
                 all_embeddings[orig_idx] = batch_embs[j]
 
     return all_embeddings
 
 
-# ──────────────────────────────────────────────────────────────
-# Group helpers
-# ──────────────────────────────────────────────────────────────
-def load_text_meta_groups(text_meta_path: str) -> list[dict]:
+# ─────────────────────────────────────────────────────────────────────────────
+# Group loading helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_text_meta_groups(text_meta_path: str) -> List[dict]:
     with open(text_meta_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def build_groups_from_transcript(
     transcript_path: str,
-    merge_gap_sec: float,
-) -> list[dict]:
+    merge_gap_sec:   float,
+) -> List[dict]:
     try:
         df = pd.read_csv(transcript_path, sep="\t", on_bad_lines="skip")
     except Exception:
         df = pd.read_csv(transcript_path, on_bad_lines="skip")
     df.columns = df.columns.str.strip()
-    df["start_time"] = pd.to_numeric(df.get("start_time", 0), errors="coerce").fillna(0.0)
-    df["stop_time"]  = pd.to_numeric(df.get("stop_time", 0), errors="coerce").fillna(0.0)
+    df["start_time"]    = pd.to_numeric(df.get("start_time", 0), errors="coerce").fillna(0.0)
+    df["stop_time"]     = pd.to_numeric(df.get("stop_time",  0), errors="coerce").fillna(0.0)
     df["speaker_clean"] = df["speaker"].str.strip().str.lower()
-    df["value"] = df["value"].fillna("").astype(str)
+    df["value"]         = df["value"].fillna("").astype(str)
 
     groups = []
-    group_id = 0
-    current = None
+    group_id, current = 0, None
 
     for _, row in df.iterrows():
         if row["speaker_clean"] == "ellie":
@@ -313,78 +349,64 @@ def build_groups_from_transcript(
     return groups
 
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Audio file finder
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
 def find_audio_file(data_root: str, pid: int) -> Optional[str]:
-    candidates = [
-        f"{pid}_AUDIO.wav", f"{pid}_audio.wav",
-        f"{pid}_P.wav", f"{pid}.wav",
-    ]
-    for name in candidates:
+    for name in [f"{pid}_AUDIO.wav", f"{pid}_audio.wav", f"{pid}_P.wav", f"{pid}.wav"]:
         path = os.path.join(data_root, name)
         if os.path.exists(path):
             return path
     return None
 
 
-# ──────────────────────────────────────────────────────────────
-# Audio prefetch (load next participant while GPU is busy)
-# ──────────────────────────────────────────────────────────────
-def prefetch_audio(audio_path: str) -> tuple[torch.Tensor, bool]:
-    """Load and resample audio. Returns (waveform_at_16k, success)."""
-    try:
-        waveform, sr = load_audio(audio_path)
-        waveform = resample_if_needed(waveform, sr)
-        return waveform, True
-    except Exception as e:
-        log.error(f"Prefetch failed for {audio_path}: {e}")
-        return torch.zeros(1), False
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-participant feature extraction
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-# ──────────────────────────────────────────────────────────────
-# Per-participant processing (OPTIMIZED)
-# ──────────────────────────────────────────────────────────────
 def extract_features(
-    waveform: torch.Tensor,
-    groups: list[dict],
-    processor: Wav2Vec2Processor,
-    model: Wav2Vec2Model,
-    device: torch.device,
-    batch_size: int,
-    use_fp16: bool,
+    waveform:        torch.Tensor,
+    groups:          List[dict],
+    processor,
+    model:           WavLMModel,
+    device:          torch.device,
+    batch_size:      int,
+    use_fp16:        bool,
     max_segment_sec: float,
-) -> tuple[np.ndarray, list[dict]]:
-    """
-    Extract wav2vec2 embeddings for all groups, using BATCHED inference.
-    """
+) -> tuple:
     if not groups:
         return np.zeros((1, EMBED_DIM), dtype=np.float32), []
 
-    # Phase 1: Slice all segments and compute acoustic features (CPU)
-    segments = []
-    metadata = []
-    valid_mask = []  # True if segment should be embedded
+    # Estimate recording-level noise floor (first 0.5s of full waveform)
+    recording_noise_floor = estimate_noise_floor(waveform)
+    log.debug(f"  recording noise floor: {recording_noise_floor:.5f}")
+
+    segments    = []
+    metadata    = []
+    valid_mask  = []
 
     for group in groups:
         t_start  = float(group["start_time"])
         t_stop   = float(group["stop_time"])
         duration = t_stop - t_start
-        group_id = group.get("group_id", len(metadata))
+        gid      = group.get("group_id", len(metadata))
 
         meta = {
-            "group_id": group_id,
-            "start_time": round(t_start, 3),
-            "stop_time": round(t_stop, 3),
-            "duration": round(duration, 3),
-            "used_zeros": False,
+            "group_id":      gid,
+            "start_time":    round(t_start, 3),
+            "stop_time":     round(t_stop,  3),
+            "duration":      round(duration, 3),
+            "used_zeros":    False,
+            "low_speech":    False,
             "mean_pause_sec": 0.0, "max_pause_sec": 0.0,
-            "n_pauses": 0, "speech_ratio": 0.0,
-            "mean_pitch_hz": -1.0, "std_pitch_hz": -1.0,
-            "mean_energy": -1.0, "std_energy": -1.0,
+            "n_pauses":      0,    "speech_ratio":  0.0,
+            "mean_pitch_hz": -1.0, "std_pitch_hz":  -1.0,
+            "mean_energy":   -1.0, "std_energy":    -1.0,
+            "noise_floor":   round(recording_noise_floor, 5),
         }
 
-        if duration < MIN_DURATION:
+        if duration < MIN_DURATION_SEC:
             meta["used_zeros"] = True
             segments.append(None)
             valid_mask.append(False)
@@ -392,22 +414,33 @@ def extract_features(
             continue
 
         segment = slice_segment(waveform, t_start, t_stop, max_segment_sec)
-        if segment.numel() < int(TARGET_SR * MIN_DURATION):
+        if segment.numel() < int(TARGET_SR * MIN_DURATION_SEC):
             meta["used_zeros"] = True
             segments.append(None)
             valid_mask.append(False)
             metadata.append(meta)
             continue
 
-        # Acoustic features (CPU, fast)
-        meta.update(compute_silence_features(segment))
+        # Acoustic features (CPU)
+        silence_feats = compute_silence_features(segment, recording_noise_floor)
+        meta.update(silence_feats)
         meta.update(compute_prosody_features(segment))
+
+        # FIX: quality gate on speech ratio
+        if silence_feats["speech_ratio"] < MIN_SPEECH_RATIO:
+            meta["used_zeros"] = True
+            meta["low_speech"] = True
+            segments.append(None)
+            valid_mask.append(False)
+            metadata.append(meta)
+            log.debug(f"  Group {gid}: speech_ratio={silence_feats['speech_ratio']:.2f} < {MIN_SPEECH_RATIO} → zeros")
+            continue
 
         segments.append(segment)
         valid_mask.append(True)
         metadata.append(meta)
 
-    # Phase 2: Batch embed all valid segments (GPU)
+    # Batch embed valid segments
     valid_segments = [s for s, v in zip(segments, valid_mask) if v]
 
     if valid_segments:
@@ -417,17 +450,18 @@ def extract_features(
                 batch_size=batch_size, use_fp16=use_fp16,
             )
         except Exception as e:
-            log.error(f"Batch embedding failed: {e}, falling back to zeros")
+            log.error(f"Batch embedding failed: {e} — using zeros for this batch")
             valid_embeddings = [np.zeros(EMBED_DIM, dtype=np.float32)] * len(valid_segments)
-            for i, (v, meta) in enumerate(zip(valid_mask, metadata)):
+            for i, v in enumerate(valid_mask):
                 if v:
-                    meta["used_zeros"] = True
+                    metadata[i]["used_zeros"] = True
+    else:
+        valid_embeddings = []
 
-    # Phase 3: Reassemble in original order
-    embeddings = []
-    valid_iter = iter(valid_embeddings) if valid_segments else iter([])
-
-    for v, meta in zip(valid_mask, metadata):
+    # Reassemble
+    embeddings  = []
+    valid_iter  = iter(valid_embeddings)
+    for v in valid_mask:
         if v:
             embeddings.append(next(valid_iter))
         else:
@@ -437,20 +471,24 @@ def extract_features(
 
 
 def process_participant(
-    pid: int,
-    data_root: str,
-    waveform: torch.Tensor,
-    groups: list[dict],
-    processor: Wav2Vec2Processor,
-    model: Wav2Vec2Model,
-    device: torch.device,
-    batch_size: int,
-    use_fp16: bool,
+    pid:             int,
+    data_root:       str,
+    waveform:        torch.Tensor,
+    groups:          List[dict],
+    processor,
+    model:           WavLMModel,
+    device:          torch.device,
+    batch_size:      int,
+    use_fp16:        bool,
     max_segment_sec: float,
+    overwrite:       bool,
 ) -> bool:
-    """Process one participant with pre-loaded audio."""
     out_npy  = os.path.join(data_root, f"{pid}_audio_feats.npy")
     out_meta = os.path.join(data_root, f"{pid}_audio_feats_meta.json")
+
+    if not overwrite and os.path.exists(out_npy):
+        log.info(f"[{pid}] Already exists — skip (use --overwrite to redo)")
+        return True
 
     try:
         embeddings, meta = extract_features(
@@ -465,86 +503,93 @@ def process_participant(
     with open(out_meta, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    n_groups = len(meta)
-    n_zeros  = sum(1 for m in meta if m.get("used_zeros"))
-    log.info(f"[{pid}] Done — groups={n_groups} (zeros={n_zeros}) | shape={embeddings.shape}")
+    n_groups    = len(meta)
+    n_zeros     = sum(1 for m in meta if m.get("used_zeros"))
+    n_low_speech = sum(1 for m in meta if m.get("low_speech"))
+    log.info(
+        f"[{pid}] Done — groups={n_groups} "
+        f"(zeros={n_zeros}, low_speech={n_low_speech}) "
+        f"shape={embeddings.shape}"
+    )
     return True
 
 
-# ──────────────────────────────────────────────────────────────
-# Main (with prefetch pipeline)
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Prefetch helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def prefetch_audio(audio_path: str) -> tuple:
+    try:
+        waveform, sr = load_audio(audio_path)
+        waveform = resample_if_needed(waveform, sr)
+        return waveform, True
+    except Exception as e:
+        log.error(f"Prefetch failed: {audio_path}: {e}")
+        return torch.zeros(1), False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract wav2vec2 audio embeddings — optimized (v2)"
+        description="Extract WavLM audio embeddings (v3 — adaptive VAD, layer 6-11 pool)"
     )
-    parser.add_argument("--data_root",    default="daicwoz/")
-    parser.add_argument("--split_csv",    required=True)
-    parser.add_argument("--model_name",   default="facebook/wav2vec2-base-960h")
-    parser.add_argument("--hf_token",     default=None)
-    parser.add_argument("--batch_size",   type=int, default=16,
-                        help="Batch size for wav2vec2 inference (default: 16). "
-                             "Increase for GPU with more VRAM, decrease if OOM.")
-    parser.add_argument("--merge_gap",    type=float, default=DEFAULT_MERGE_GAP_SEC)
+    parser.add_argument("--data_root",   default="daicwoz/")
+    parser.add_argument("--split_csv",   required=True)
+    parser.add_argument("--model_name",  default="microsoft/wavlm-base-plus",
+                        help="Recommended: wavlm-base-plus (self-supervised, not ASR-finetuned)")
+    parser.add_argument("--hf_token",    default=None)
+    parser.add_argument("--batch_size",  type=int, default=16)
+    parser.add_argument("--merge_gap",   type=float, default=DEFAULT_MERGE_GAP)
     parser.add_argument("--no_text_meta", action="store_true")
-    parser.add_argument("--overwrite",    action="store_true")
-    parser.add_argument("--fp16",         action="store_true",
-                        help="Use FP16 autocast on GPU (~2x faster)")
-    parser.add_argument("--max_segment_sec", type=float, default=MAX_SEGMENT_SEC,
-                        help="Cap segment duration (seconds) to avoid OOM")
-    parser.add_argument("--num_prefetch_workers", type=int, default=2,
-                        help="Number of threads for audio prefetching")
+    parser.add_argument("--overwrite",   action="store_true")
+    parser.add_argument("--fp16",        action="store_true")
+    parser.add_argument("--max_segment_sec", type=float, default=MAX_SEGMENT_SEC)
+    parser.add_argument("--num_prefetch_workers", type=int, default=2)
     args = parser.parse_args()
 
-    use_text_meta = not args.no_text_meta
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_fp16 = args.fp16 and device.type == "cuda"
 
-    log.info(f"Device       : {device}")
-    log.info(f"Model        : {args.model_name}")
-    log.info(f"Batch size   : {args.batch_size}")
-    log.info(f"FP16         : {use_fp16}")
-    log.info(f"Max segment  : {args.max_segment_sec}s")
-    log.info(f"Use text meta: {use_text_meta}")
-    log.info(f"Librosa      : {'yes' if HAS_LIBROSA else 'no'}")
+    log.info(f"Device      : {device}")
+    log.info(f"Model       : {args.model_name}")
+    log.info(f"FP16        : {use_fp16}")
+    log.info(f"Layer pool  : [{WAVLM_LAYER_START},{WAVLM_LAYER_END}) (upper-mid layers)")
+    log.info(f"VAD         : adaptive (noise_floor * {VAD_NOISE_MULTIPLIER:.1f})")
+    log.info(f"Min speech  : {MIN_SPEECH_RATIO} ratio (below → zeros)")
+    log.info(f"Librosa     : {'yes' if HAS_LIBROSA else 'no'}")
 
     hf_kwargs = {"token": args.hf_token} if args.hf_token else {}
-    processor = Wav2Vec2Processor.from_pretrained(args.model_name, **hf_kwargs)
-    model     = Wav2Vec2Model.from_pretrained(args.model_name, **hf_kwargs).to(device)
+    processor = AutoProcessor.from_pretrained(args.model_name, **hf_kwargs)
+    model     = WavLMModel.from_pretrained(args.model_name, **hf_kwargs).to(device)
     model.eval()
-
-    # Enable torch.compile if available (PyTorch 2.0+)
-    log.info("torch.compile disabled (stability)")
 
     split_df = pd.read_csv(args.split_csv)
     split_df.columns = [c.strip() for c in split_df.columns]
     pids = split_df["Participant_ID"].astype(int).tolist()
-    log.info(f"Participants : {len(pids)}")
+    log.info(f"Participants: {len(pids)}")
 
-    # Prepare participant info (groups + audio paths)
+    use_text_meta = not args.no_text_meta
+
     participant_info = []
     for pid in pids:
         transcript_path = os.path.join(args.data_root, f"{pid}_TRANSCRIPT.csv")
         text_meta_path  = os.path.join(args.data_root, f"{pid}_text_feats_meta.json")
-        out_npy         = os.path.join(args.data_root, f"{pid}_audio_feats.npy")
-
-        # if not args.overwrite and os.path.exists(out_npy):
-        #     log.info(f"[{pid}] Already exists — skip")
-        #     continue
 
         audio_path = find_audio_file(args.data_root, pid)
         if audio_path is None:
-            log.warning(f"[{pid}] Audio file not found")
+            log.warning(f"[{pid}] Audio file not found — skip")
             continue
 
-        # Load groups
         if use_text_meta and os.path.exists(text_meta_path):
             groups = load_text_meta_groups(text_meta_path)
         else:
             if use_text_meta:
-                log.warning(f"[{pid}] text meta not found — fallback")
+                log.warning(f"[{pid}] text meta not found — fallback to transcript")
             if not os.path.exists(transcript_path):
-                log.warning(f"[{pid}] Transcript not found")
+                log.warning(f"[{pid}] Transcript not found — skip")
                 continue
             groups = build_groups_from_transcript(transcript_path, args.merge_gap)
 
@@ -554,24 +599,16 @@ def main():
         log.info("Nothing to process.")
         return
 
-    # Process with prefetch pipeline
     executor = ThreadPoolExecutor(max_workers=args.num_prefetch_workers)
-    success = 0
-
-    # Submit first prefetch
-    futures = {}
-    for i, (pid, audio_path, groups) in enumerate(participant_info):
+    futures  = {}
+    for i, (pid, audio_path, _) in enumerate(participant_info):
         if i < args.num_prefetch_workers:
             futures[i] = executor.submit(prefetch_audio, audio_path)
 
+    success = 0
     for i, (pid, audio_path, groups) in enumerate(participant_info):
-        # Get prefetched audio (or load synchronously)
-        if i in futures:
-            waveform, ok = futures[i].result()
-        else:
-            waveform, ok = prefetch_audio(audio_path)
+        waveform, ok = futures[i].result() if i in futures else prefetch_audio(audio_path)
 
-        # Submit next prefetch
         next_i = i + args.num_prefetch_workers
         if next_i < len(participant_info):
             _, next_audio, _ = participant_info[next_i]
@@ -582,11 +619,11 @@ def main():
             continue
 
         log.info(f"[{pid}] Embedding {len(groups)} groups ({audio_path})")
-
         ok = process_participant(
             pid, args.data_root, waveform, groups,
             processor, model, device,
             args.batch_size, use_fp16, args.max_segment_sec,
+            overwrite=args.overwrite,
         )
         if ok:
             success += 1

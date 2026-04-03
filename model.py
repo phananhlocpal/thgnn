@@ -1,35 +1,23 @@
 """
-model.py
+model.py — HMSGNet v2
 
 HMSG-Net: Heterogeneous Multi-modal Symptom-Guided Graph Network
 ================================================================
 
-Two-modal variant: Text (BERT, 768-dim) + Audio (wav2vec, 768-dim).
-
-Key components
---------------
-FocalLoss          – handles severe class imbalance
-SymptomRoutedRGAT  – the novel SR-RGAT layer
-HMSGNet            – full model (encoder → SR-RGAT × 3 → readout → fusion → heads)
-compute_loss       – combines focal + BCE + SmoothL1
-
-FIXES vs original:
-  1. [FIX-INTERPRETABILITY] SR-RGAT now optionally returns per-node symptom
-     routing weights (gate: N×K and sym_edge_w: K×R) via return_routing=True.
-     Used for SHAP-style analysis in train.py / a separate explain.py.
-  2. [FIX-INTERPRETABILITY] HMSGNet.forward() accepts return_routing=True,
-     returns (dep_logit, sym_logits, phq_pred, routing_info) where routing_info
-     is a dict with keys: "gates" (list of N×K tensors per layer),
-     "sym_edge_weights" (list of K×R tensors per layer).
-     When return_routing=False (default), original 3-tuple is returned.
-  3. [FIX-STABILITY] Added numerical stability guard in scatter_softmax path
-     for empty edge sets (edge_index.shape[1]==0 after edge dropout).
-  4. [FIX-STABILITY] ModalEncoder: added gradient checkpointing option to
-     reduce memory on long sequences.
+Thay đổi vs v1
+──────────────
+[FIX] NUM_EDGE_TYPES = 6 (thêm T->T_same_question, A->A_same_question).
+[FIX] TEXT_DIM=777, AUDIO_DIM=777 (768 + 9 acoustic side-channels).
+      UNIFIED_DIM = 1554.
+[FIX] drop_edge = 0.2 (giảm từ 0.3) để không drop toàn bộ same-question edges
+      trong batches nhỏ.
+[IMPROVE] SR-RGAT: thêm residual gate (sigmoid-gated) thay vì additive residual.
+[IMPROVE] GatedModalFusion: text và audio attend to each other qua gated attention,
+          thay vì naive concatenation.
 """
 
 import math
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -38,14 +26,14 @@ from torch import Tensor
 from torch_scatter import scatter_add, scatter_softmax
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Architecture hyper-parameters
+# Hyper-parameters
 # ─────────────────────────────────────────────────────────────────────────────
 
-TEXT_DIM   = 768
-AUDIO_DIM  = 768
-UNIFIED_DIM = TEXT_DIM + AUDIO_DIM
+TEXT_DIM       = 777     # 768 (Mental-BERT) + 9 (text acoustic side-channels)
+AUDIO_DIM      = 777     # 768 (WavLM-base-plus) + 9 (audio acoustic side-channels)
+UNIFIED_DIM    = TEXT_DIM + AUDIO_DIM   # 1554
 
-NUM_EDGE_TYPES = 4
+NUM_EDGE_TYPES = 6       # T->T_temp, A->A_temp, T->A_utt, A->T_utt, T->T_q, A->A_q
 NUM_NODE_TYPES = 2
 NUM_SYMPTOMS   = 8
 
@@ -59,26 +47,11 @@ DROPOUT        = 0.35
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FocalLoss(nn.Module):
-    """
-    Binary Focal Loss.
-
-    Parameters
-    ----------
-    alpha : float
-        Balancing factor for the positive class.
-    gamma : float
-        Focusing exponent. Default 2.0.
-    reduction : str
-        'mean' | 'sum' | 'none'.
-    label_smoothing : float
-        If > 0, smooth hard targets before computing BCE.
-    """
-
     def __init__(
         self,
-        alpha: float = 0.75,
-        gamma: float = 2.0,
-        reduction: str = "mean",
+        alpha:           float = 0.75,
+        gamma:           float = 2.0,
+        reduction:       str   = "mean",
         label_smoothing: float = 0.0,
     ):
         super().__init__()
@@ -90,20 +63,14 @@ class FocalLoss(nn.Module):
     def forward(self, logits: Tensor, targets: Tensor) -> Tensor:
         targets = targets.float()
         probs   = torch.sigmoid(logits)
-
-        if self.label_smoothing > 0.0:
-            smooth_t = targets * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
-        else:
-            smooth_t = targets
+        smooth_t = (targets * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
+                    if self.label_smoothing > 0 else targets)
         bce     = F.binary_cross_entropy_with_logits(logits, smooth_t, reduction="none")
-        p_t     = probs * targets + (1.0 - probs) * (1.0 - targets)
-        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
-        loss    = alpha_t * (1.0 - p_t) ** self.gamma * bce
-
-        if self.reduction == "mean":
-            return loss.mean()
-        elif self.reduction == "sum":
-            return loss.sum()
+        p_t     = probs * targets + (1 - probs) * (1 - targets)
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        loss    = alpha_t * (1 - p_t) ** self.gamma * bce
+        if self.reduction == "mean":  return loss.mean()
+        if self.reduction == "sum":   return loss.sum()
         return loss
 
 
@@ -114,63 +81,56 @@ class FocalLoss(nn.Module):
 def _xavier_linear(in_f: int, out_f: int, bias: bool = True) -> nn.Linear:
     layer = nn.Linear(in_f, out_f, bias=bias)
     nn.init.xavier_uniform_(layer.weight)
-    if bias:
-        nn.init.zeros_(layer.bias)
+    if bias: nn.init.zeros_(layer.bias)
     return layer
 
 
 class _MLP(nn.Module):
-    def __init__(self, in_f: int, hidden_f: int, out_f: int, dropout: float = 0.0):
+    def __init__(self, in_f: int, h_f: int, out_f: int, dropout: float = 0.0):
         super().__init__()
         self.net = nn.Sequential(
-            _xavier_linear(in_f, hidden_f),
-            nn.ReLU(inplace=True),
+            _xavier_linear(in_f, h_f), nn.ReLU(inplace=True),
             nn.Dropout(p=dropout) if dropout > 0 else nn.Identity(),
-            _xavier_linear(hidden_f, out_f),
+            _xavier_linear(h_f, out_f),
         )
-
     def forward(self, x: Tensor) -> Tensor:
         return self.net(x)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SR-RGAT: Symptom-Routed Relational Graph Attention
+# SR-RGAT v2: Symptom-Routed Relational Graph Attention
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SymptomRoutedRGAT(nn.Module):
     """
-    One SR-RGAT layer.
+    SR-RGAT layer v2.
 
-    Forward pass
-    ─────────────
-    Given:
-      h              : (N, H)   node features
-      edge_index     : (2, E)   COO edge list
-      edge_type      : (E,)     int in 0..R-1
+    Forward: h, edge_index (2,E), edge_type (E,) → h_out (N, H).
 
-    Returns:
-      h_out          : (N, H)   updated node features
-      routing_info   : dict with keys "gate" (N, K), "sym_edge_w" (K, R)
-                       Only populated when return_routing=True.
+    Changes from v1:
+    - Residual gate: h_out = LayerNorm(gate*h_new + (1-gate)*h)
+      where gate = sigmoid(W_gate * concat(h, h_new))
+    - Supports 6 edge types.
     """
 
     def __init__(
         self,
-        hidden_dim:     int = HIDDEN_DIM,
-        num_edge_types: int = NUM_EDGE_TYPES,
-        num_symptoms:   int = NUM_SYMPTOMS,
-        n_heads:        int = 4,
+        hidden_dim:     int   = HIDDEN_DIM,
+        num_edge_types: int   = NUM_EDGE_TYPES,
+        num_symptoms:   int   = NUM_SYMPTOMS,
+        n_heads:        int   = 4,
         dropout:        float = DROPOUT,
-        drop_edge:      float = 0.3,
+        drop_edge:      float = 0.2,
     ):
         super().__init__()
-        self.H  = hidden_dim
-        self.R  = num_edge_types
-        self.K  = num_symptoms
-        self.nh = n_heads
+        self.H          = hidden_dim
+        self.R          = num_edge_types
+        self.K          = num_symptoms
+        self.nh         = n_heads
         self.drop_edge_p = drop_edge
-        assert hidden_dim % n_heads == 0, "hidden_dim must be divisible by n_heads"
-        self.head_dim = hidden_dim // n_heads
+        assert hidden_dim % n_heads == 0
+        self.head_dim   = hidden_dim // n_heads
+        self._scale     = math.sqrt(self.head_dim)
 
         self.W_q = nn.Parameter(torch.empty(num_edge_types, hidden_dim, hidden_dim))
         self.W_k = nn.Parameter(torch.empty(num_edge_types, hidden_dim, hidden_dim))
@@ -178,122 +138,78 @@ class SymptomRoutedRGAT(nn.Module):
         for w in (self.W_q, self.W_k, self.W_v):
             nn.init.xavier_uniform_(w.view(num_edge_types * hidden_dim, hidden_dim))
 
-        self.routing_mlp = _MLP(hidden_dim, hidden_dim, num_symptoms, dropout=dropout)
-
+        self.routing_mlp     = _MLP(hidden_dim, hidden_dim, num_symptoms, dropout=dropout)
         self.sym_edge_logits = nn.Parameter(torch.empty(num_symptoms, num_edge_types))
         nn.init.xavier_uniform_(self.sym_edge_logits)
 
         self.W_symptom = nn.ModuleList([
-            _xavier_linear(hidden_dim, hidden_dim, bias=True)
-            for _ in range(num_symptoms)
+            _xavier_linear(hidden_dim, hidden_dim) for _ in range(num_symptoms)
         ])
+        self.cross_symptom = _xavier_linear(num_symptoms * hidden_dim, hidden_dim)
 
-        self.cross_symptom_linear = _xavier_linear(num_symptoms * hidden_dim, hidden_dim)
+        # Residual gate
+        self.W_gate    = _xavier_linear(2 * hidden_dim, hidden_dim)
         self.layer_norm = nn.LayerNorm(hidden_dim)
         self.dropout    = nn.Dropout(p=dropout)
-        self._scale     = math.sqrt(self.head_dim)
 
-    def _relational_agg(
-        self,
-        h: Tensor,
-        edge_index: Tensor,
-        edge_type:  Tensor,
-    ) -> Tensor:
-        N, H = h.shape
-        R    = self.R
-        device = h.device
-
-        agg_stack = torch.zeros(N, R, H, device=device, dtype=h.dtype)
-
-        # FIX-STABILITY: guard against empty edge set after dropout
+    def _relational_agg(self, h: Tensor, edge_index: Tensor, edge_type: Tensor) -> Tensor:
+        N = h.shape[0]
+        agg = torch.zeros(N, self.R, self.H, device=h.device, dtype=h.dtype)
         if edge_index.shape[1] == 0:
-            return agg_stack
+            return agg
 
-        src_idx = edge_index[0]
-        dst_idx = edge_index[1]
+        src = edge_index[0]
+        dst = edge_index[1]
 
-        for t in range(R):
+        for t in range(self.R):
             mask = (edge_type == t)
             if not mask.any():
                 continue
+            e_src = src[mask]
+            e_dst = dst[mask]
+            E_t   = e_src.shape[0]
 
-            e_src = src_idx[mask]
-            e_dst = dst_idx[mask]
-            n_edges_t = e_dst.shape[0]
+            q = (h[e_dst] @ self.W_q[t].t()).view(E_t, self.nh, self.head_dim)
+            k = (h[e_src] @ self.W_k[t].t()).view(E_t, self.nh, self.head_dim)
+            v = (h[e_src] @ self.W_v[t].t()).view(E_t, self.nh, self.head_dim)
 
-            h_src = h[e_src]
-            h_dst = h[e_dst]
+            score   = (q * k).sum(-1) / self._scale
+            dst_exp = e_dst.unsqueeze(1).expand(E_t, self.nh).reshape(-1)
+            alpha   = scatter_softmax(score.reshape(-1), dst_exp, dim=0, dim_size=N)
+            alpha   = alpha.view(E_t, self.nh, 1)
 
-            q = (h_dst @ self.W_q[t].t()).view(-1, self.nh, self.head_dim)
-            k = (h_src @ self.W_k[t].t()).view(-1, self.nh, self.head_dim)
-            v = (h_src @ self.W_v[t].t()).view(-1, self.nh, self.head_dim)
+            agg[:, t, :] = scatter_add((alpha * v).view(E_t, self.H), e_dst, dim=0, dim_size=N)
+        return agg
 
-            score = (q * k).sum(-1) / self._scale  # (E_t, nh)
+    def forward(self, h: Tensor, edge_index: Tensor, edge_type: Tensor) -> Tensor:
+        if self.training and self.drop_edge_p > 0 and edge_index.shape[1] > 0:
+            keep       = torch.rand(edge_index.shape[1], device=h.device) > self.drop_edge_p
+            edge_index = edge_index[:, keep]
+            edge_type  = edge_type[keep]
 
-            dst_exp = e_dst.unsqueeze(1).expand(n_edges_t, self.nh).reshape(-1)
-            score_flat = score.reshape(-1)
-            alpha_flat = scatter_softmax(score_flat, dst_exp, dim=0, dim_size=N)
-            alpha = alpha_flat.view(n_edges_t, self.nh, 1)
+        agg_stack  = self._relational_agg(h, edge_index, edge_type)
+        gate_vals  = F.softmax(self.routing_mlp(h), dim=-1)    # (N, K)
+        sym_edge_w = F.softmax(self.sym_edge_logits, dim=1)    # (K, R)
 
-            weighted_v = (alpha * v).view(n_edges_t, H)
-            agg_t = scatter_add(weighted_v, e_dst, dim=0, dim_size=N)
-            agg_stack[:, t, :] = agg_t
-
-        return agg_stack
-
-    def forward(
-        self,
-        h: Tensor,
-        edge_index: Tensor,
-        edge_type:  Tensor,
-        return_routing: bool = False,
-    ) -> Union[Tensor, Tuple[Tensor, Dict]]:
-        N = h.shape[0]
-
-        if self.training and self.drop_edge_p > 0.0 and edge_index.shape[1] > 0:
-            keep_mask  = torch.rand(edge_index.shape[1], device=h.device) > self.drop_edge_p
-            edge_index = edge_index[:, keep_mask]
-            edge_type  = edge_type[keep_mask]
-
-        agg_stack = self._relational_agg(h, edge_index, edge_type)
-
-        # Symptom routing gate: (N, K) — per-node soft routing weights
-        gate = F.softmax(self.routing_mlp(h), dim=-1)
-
-        # Edge-type weights per symptom: (K, R)
-        sym_edge_w = F.softmax(self.sym_edge_logits, dim=1)
-
-        symptom_channels = []
+        channels = []
         for k in range(self.K):
-            edge_weights = sym_edge_w[k]                              # (R,)
-            s_k = (agg_stack * edge_weights.view(1, self.R, 1)).sum(dim=1)   # (N, H)
-            s_k = self.W_symptom[k](s_k)
-            s_k = F.relu(s_k)
-            s_k = s_k * gate[:, k].unsqueeze(-1)                     # (N, H)
-            symptom_channels.append(s_k)
+            s_k = (agg_stack * sym_edge_w[k].view(1, self.R, 1)).sum(dim=1)
+            s_k = F.relu(self.W_symptom[k](s_k)) * gate_vals[:, k].unsqueeze(-1)
+            channels.append(s_k)
 
-        cat_symptoms = torch.cat(symptom_channels, dim=-1)            # (N, K*H)
-        h_new = self.cross_symptom_linear(cat_symptoms)
-        h_new = F.relu(h_new)
+        h_new = F.relu(self.cross_symptom(torch.cat(channels, dim=-1)))
         h_new = self.dropout(h_new)
 
-        h_out = self.layer_norm(h + h_new)
-
-        if return_routing:
-            return h_out, {
-                "gate":        gate.detach(),         # (N, K)
-                "sym_edge_w":  sym_edge_w.detach(),   # (K, R)
-            }
-        return h_out
+        # Residual gate
+        gate  = torch.sigmoid(self.W_gate(torch.cat([h, h_new], dim=-1)))
+        return self.layer_norm(gate * h_new + (1.0 - gate) * h)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Modal-specific encoder block
+# Modal encoder
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ModalEncoder(nn.Module):
-    """Linear(in_f, H) + LayerNorm + ReLU + Dropout."""
-
     def __init__(self, in_features: int, hidden_dim: int, dropout: float = DROPOUT):
         super().__init__()
         self.net = nn.Sequential(
@@ -302,33 +218,43 @@ class ModalEncoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout),
         )
-
     def forward(self, x: Tensor) -> Tensor:
         return self.net(x)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HMSGNet: full model (2-modal: Text + Audio)
+# Gated Cross-modal Fusion
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GatedModalFusion(nn.Module):
+    """
+    Text and audio attend to each other via learned gates.
+    text_gate  = sigmoid(W_t * [text; audio])
+    audio_gate = sigmoid(W_a * [audio; text])
+    fused = MLP([text_gate*text ; audio_gate*audio])
+    """
+    def __init__(self, hidden_dim: int, dropout: float = DROPOUT):
+        super().__init__()
+        self.W_tg  = _xavier_linear(2 * hidden_dim, hidden_dim)
+        self.W_ag  = _xavier_linear(2 * hidden_dim, hidden_dim)
+        self.out   = nn.Sequential(
+            _xavier_linear(2 * hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+        )
+
+    def forward(self, t: Tensor, a: Tensor) -> Tensor:
+        tg = torch.sigmoid(self.W_tg(torch.cat([t, a], dim=-1)))
+        ag = torch.sigmoid(self.W_ag(torch.cat([a, t], dim=-1)))
+        return self.out(torch.cat([tg * t, ag * a], dim=-1))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HMSGNet v2
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HMSGNet(nn.Module):
-    """
-    Heterogeneous Multi-modal Symptom-Guided Network (2-modal).
-
-    Returns
-    -------
-    default (return_routing=False):
-        (dep_logit, symptom_logits, phq_pred)
-
-    with return_routing=True:
-        (dep_logit, symptom_logits, phq_pred, routing_info)
-        where routing_info = {
-          "gates":           List[Tensor(N, K)]  — one per GNN layer
-          "sym_edge_weights": List[Tensor(K, R)] — one per GNN layer
-        }
-        Use routing_info for interpretability / SHAP input-attribution.
-    """
-
     def __init__(
         self,
         hidden_dim:     int   = HIDDEN_DIM,
@@ -337,7 +263,7 @@ class HMSGNet(nn.Module):
         num_symptoms:   int   = NUM_SYMPTOMS,
         n_heads:        int   = 4,
         dropout:        float = DROPOUT,
-        drop_edge:      float = 0.3,
+        drop_edge:      float = 0.2,
         feat_noise:     float = 0.05,
         text_dim:       int   = TEXT_DIM,
         audio_dim:      int   = AUDIO_DIM,
@@ -345,44 +271,30 @@ class HMSGNet(nn.Module):
         super().__init__()
         self.H          = hidden_dim
         self.K          = num_symptoms
-        self.dropout_p  = dropout
         self.feat_noise = feat_noise
         self._text_dim  = text_dim
         self._audio_dim = audio_dim
 
         self.text_encoder  = ModalEncoder(text_dim,  hidden_dim, dropout)
         self.audio_encoder = ModalEncoder(audio_dim, hidden_dim, dropout)
-
         self.node_type_emb = nn.Embedding(2, hidden_dim)
         nn.init.normal_(self.node_type_emb.weight, std=0.02)
-
-        self.pos_encoder = nn.Sequential(
-            _xavier_linear(1, hidden_dim // 2),
-            nn.ReLU(inplace=True),
+        self.pos_encoder   = nn.Sequential(
+            _xavier_linear(1, hidden_dim // 2), nn.ReLU(inplace=True),
             _xavier_linear(hidden_dim // 2, hidden_dim),
         )
 
         self.gnn_layers = nn.ModuleList([
             SymptomRoutedRGAT(
-                hidden_dim=hidden_dim,
-                num_edge_types=num_edge_types,
-                num_symptoms=num_symptoms,
-                n_heads=n_heads,
-                dropout=dropout,
-                drop_edge=drop_edge,
-            )
-            for _ in range(num_gnn_layers)
+                hidden_dim=hidden_dim, num_edge_types=num_edge_types,
+                num_symptoms=num_symptoms, n_heads=n_heads,
+                dropout=dropout, drop_edge=drop_edge,
+            ) for _ in range(num_gnn_layers)
         ])
 
-        self.text_att  = _xavier_linear(hidden_dim, 1)
-        self.audio_att = _xavier_linear(hidden_dim, 1)
-
-        self.modal_fusion = nn.Sequential(
-            _xavier_linear(2 * hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout),
-        )
+        self.text_att    = _xavier_linear(hidden_dim, 1)
+        self.audio_att   = _xavier_linear(hidden_dim, 1)
+        self.modal_fusion = GatedModalFusion(hidden_dim, dropout)
 
         self.dep_head = nn.Sequential(
             _xavier_linear(hidden_dim, hidden_dim // 2),
@@ -390,156 +302,52 @@ class HMSGNet(nn.Module):
             nn.Dropout(p=dropout),
             _xavier_linear(hidden_dim // 2, 1),
         )
-
         self.symptom_heads = nn.ModuleList([
             _xavier_linear(hidden_dim, 1) for _ in range(num_symptoms)
         ])
-
         self.phq_head = _xavier_linear(hidden_dim, 1)
 
     def _encode_by_node_type(self, x: Tensor, node_type: Tensor) -> Tensor:
-        device = x.device
-        H = self.H
         N = x.shape[0]
-        h = torch.zeros(N, H, device=device, dtype=x.dtype)
-
-        if self.training and self.feat_noise > 0.0:
+        h = torch.zeros(N, self.H, device=x.device, dtype=x.dtype)
+        if self.training and self.feat_noise > 0:
             x = x + torch.randn_like(x) * self.feat_noise
-
-        t_dim = self._text_dim
-        a_dim = self._audio_dim
-
-        mask0 = (node_type == 0)
-        if mask0.any():
-            h[mask0] = self.text_encoder(x[mask0, :t_dim])
-
-        mask1 = (node_type == 1)
-        if mask1.any():
-            h[mask1] = self.audio_encoder(x[mask1, t_dim: t_dim + a_dim])
-
+        m0 = (node_type == 0)
+        if m0.any(): h[m0] = self.text_encoder(x[m0, :self._text_dim])
+        m1 = (node_type == 1)
+        if m1.any(): h[m1] = self.audio_encoder(x[m1, self._text_dim: self._text_dim + self._audio_dim])
         return h
 
     @staticmethod
-    def _att_pool(h: Tensor, idx: Tensor, att_w: Tensor, B: int) -> Tensor:
-        alpha = scatter_softmax(att_w.squeeze(-1), idx, dim=0, dim_size=B)
+    def _att_pool(h: Tensor, idx: Tensor, w: Tensor, B: int) -> Tensor:
+        alpha = scatter_softmax(w.squeeze(-1), idx, dim=0, dim_size=B)
         return scatter_add(h * alpha.unsqueeze(-1), idx, dim=0, dim_size=B)
 
-    def forward(
-        self,
-        data,
-        return_routing: bool = False,
-    ) -> Union[
-        Tuple[Tensor, Tensor, Tensor],
-        Tuple[Tensor, Tensor, Tensor, Dict],
-    ]:
-        x          = data.x
-        edge_index = data.edge_index
-        edge_type  = data.edge_type
-        node_type  = data.node_type
-        pos        = data.pos
-        batch      = data.batch
-
+    def forward(self, data) -> Tuple[Tensor, Tensor, Tensor]:
+        x, edge_index, edge_type = data.x, data.edge_index, data.edge_type
+        node_type, pos, batch    = data.node_type, data.pos, data.batch
         B = int(batch.max().item()) + 1
 
-        # 1. Modal-specific encoding
         h = self._encode_by_node_type(x, node_type)
-
-        # 2. Add positional and node_type embeddings
-        pos_emb  = self.pos_encoder(pos.unsqueeze(-1))
-        type_emb = self.node_type_emb(node_type)
-        h = h + pos_emb + type_emb
-
-        # 3. SR-RGAT layers
-        all_gates: List[Tensor] = []
-        all_sym_edge_w: List[Tensor] = []
+        h = h + self.pos_encoder(pos.unsqueeze(-1)) + self.node_type_emb(node_type)
 
         for gnn in self.gnn_layers:
-            if return_routing:
-                h, rinfo = gnn(h, edge_index, edge_type, return_routing=True)
-                all_gates.append(rinfo["gate"])
-                all_sym_edge_w.append(rinfo["sym_edge_w"])
-            else:
-                h = gnn(h, edge_index, edge_type, return_routing=False)
+            h = gnn(h, edge_index, edge_type)
 
-        # 4. Attention readout per modality
-        mask_t = (node_type == 0)
-        mask_a = (node_type == 1)
+        mt = (node_type == 0)
+        ma = (node_type == 1)
+        text_emb  = self._att_pool(h[mt], batch[mt], torch.sigmoid(self.text_att(h[mt])),  B)
+        audio_emb = self._att_pool(h[ma], batch[ma], torch.sigmoid(self.audio_att(h[ma])), B)
+        fused     = self.modal_fusion(text_emb, audio_emb)
 
-        h_t = h[mask_t]
-        h_a = h[mask_a]
-
-        batch_t = batch[mask_t]
-        batch_a = batch[mask_a]
-
-        text_emb  = self._att_pool(h_t, batch_t, torch.sigmoid(self.text_att(h_t)),  B)
-        audio_emb = self._att_pool(h_a, batch_a, torch.sigmoid(self.audio_att(h_a)), B)
-
-        # 5. Cross-modal gated fusion
-        fused = self.modal_fusion(torch.cat([text_emb, audio_emb], dim=-1))
-
-        # 6. Task heads
         dep_logit      = self.dep_head(fused).squeeze(-1)
         symptom_logits = torch.cat([head(fused) for head in self.symptom_heads], dim=-1)
         phq_pred       = self.phq_head(fused).squeeze(-1)
-
-        if return_routing:
-            routing_info = {
-                "gates":            all_gates,       # list of (N, K) per layer
-                "sym_edge_weights": all_sym_edge_w,  # list of (K, R) per layer
-                "node_type":        node_type,       # (N,) for splitting T/A
-                "batch":            batch,           # (N,) graph assignment
-            }
-            return dep_logit, symptom_logits, phq_pred, routing_info
-
         return dep_logit, symptom_logits, phq_pred
-
-    # ── Interpretability helpers ───────────────────────────────────────────────
-
-    @torch.no_grad()
-    def get_symptom_routing_summary(self, data) -> Dict:
-        """
-        Run forward with return_routing=True and return a clean summary dict.
-
-        Useful for SHAP-style analysis and paper visualizations.
-
-        Returns
-        -------
-        dict with:
-          "mean_gate_per_symptom"    : (K,)  averaged gate activation across nodes
-          "sym_edge_weights_by_layer": list of (K, R) numpy arrays
-          "gate_text_vs_audio"       : dict with "text" and "audio" keys → (K,)
-        """
-        self.eval()
-        _, _, _, rinfo = self.forward(data, return_routing=True)
-
-        node_type = rinfo["node_type"]
-        text_mask = (node_type == 0).cpu()
-        audio_mask= (node_type == 1).cpu()
-
-        # Average gate across all layers (last layer is most task-relevant)
-        last_gate = rinfo["gates"][-1].cpu()  # (N, K)
-
-        mean_gate           = last_gate.mean(dim=0).numpy()
-        mean_gate_text_only = last_gate[text_mask].mean(dim=0).numpy()
-        mean_gate_audio_only= last_gate[audio_mask].mean(dim=0).numpy()
-
-        sym_edge_weights = [w.cpu().numpy() for w in rinfo["sym_edge_weights"]]
-
-        return {
-            "mean_gate_per_symptom"    : mean_gate,
-            "mean_gate_text_nodes"     : mean_gate_text_only,
-            "mean_gate_audio_nodes"    : mean_gate_audio_only,
-            "sym_edge_weights_by_layer": sym_edge_weights,
-            "phq8_labels": [
-                "NoInterest", "Depressed", "Sleep", "Tired",
-                "Appetite",   "Failure",   "Concentrating", "Moving",
-            ],
-            "edge_type_labels": ["T→T", "A→A", "T→A", "A→T"],
-        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# compute_loss
+# Loss
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_loss(
@@ -555,100 +363,90 @@ def compute_loss(
     label_smoothing: float = 0.0,
     device:          Optional[torch.device] = None,
 ) -> Tuple[Tensor, dict]:
-    dep_labels  = dep_labels.float()
-    phq8_labels = phq8_labels.float()
-    phq_scores  = phq_scores.float()
-
     B = dep_logit.shape[0]
+    phq8_labels = phq8_labels.float()
     if phq8_labels.dim() == 1 and phq8_labels.shape[0] == B * 8:
         phq8_labels = phq8_labels.view(B, 8)
 
-    focal_fn = FocalLoss(alpha=focal_alpha, gamma=2.0, reduction="mean",
-                         label_smoothing=label_smoothing)
-    loss_dep = focal_fn(dep_logit, dep_labels)
-
-    phq8_binary = (phq8_labels > 0).float()
-    loss_symp   = F.binary_cross_entropy_with_logits(
-        symptom_logits, phq8_binary, reduction="mean"
+    focal_fn  = FocalLoss(alpha=focal_alpha, gamma=2.0, reduction="mean",
+                          label_smoothing=label_smoothing)
+    loss_dep  = focal_fn(dep_logit, dep_labels.float())
+    loss_symp = F.binary_cross_entropy_with_logits(
+        symptom_logits, (phq8_labels > 0).float(), reduction="mean"
     )
+    loss_phq  = F.smooth_l1_loss(phq_pred, phq_scores.float() / 24.0, reduction="mean")
+    total     = loss_dep + w_symptom * loss_symp + w_phq * loss_phq
 
-    loss_phq = F.smooth_l1_loss(phq_pred, phq_scores / 24.0, reduction="mean")
-
-    total = loss_dep + w_symptom * loss_symp + w_phq * loss_phq
-
-    loss_dict = {
+    return total, {
         "loss_total":   total.item(),
         "loss_dep":     loss_dep.item(),
         "loss_symptom": loss_symp.item(),
         "loss_phq":     loss_phq.item(),
     }
-    return total, loss_dict
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Quick smoke-test
+# Smoke test
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    from collections import defaultdict
     from torch_geometric.data import Data, Batch
 
     def _make_dummy(n_utt: int = 20):
-        N = 2 * n_utt
+        N     = 2 * n_utt
+        T_off = 0
+        A_off = n_utt
+        q_ids = [str(i // 3) for i in range(n_utt)]
+
         ei, et = [], []
-        T_off, A_off = 0, n_utt
         for i in range(n_utt):
-            for j in range(max(0, i - 3), min(n_utt, i + 4)):
+            for j in range(max(0, i-3), min(n_utt, i+4)):
                 if i != j:
-                    ei.append([T_off + i, T_off + j]); et.append(0)
-                    ei.append([A_off + i, A_off + j]); et.append(1)
+                    ei.append([T_off+i, T_off+j]); et.append(0)
+                    ei.append([A_off+i, A_off+j]); et.append(1)
         for i in range(n_utt):
-            ei.append([T_off + i, A_off + i]); et.append(2)
-            ei.append([A_off + i, T_off + i]); et.append(3)
-        edge_index = torch.tensor(ei, dtype=torch.long).t().contiguous()
-        edge_type  = torch.tensor(et, dtype=torch.long)
-        node_type  = torch.tensor([0]*n_utt + [1]*n_utt, dtype=torch.long)
-        pos        = torch.linspace(0, 1, n_utt).repeat(2)
-        x          = torch.randn(N, UNIFIED_DIM)
+            ei.append([T_off+i, A_off+i]); et.append(2)
+            ei.append([A_off+i, T_off+i]); et.append(3)
+
+        q_map = defaultdict(list)
+        for i, q in enumerate(q_ids):
+            q_map[q].append(i)
+        for idxs in q_map.values():
+            for a in range(len(idxs)):
+                for b in range(len(idxs)):
+                    if a != b:
+                        ei.append([T_off+idxs[a], T_off+idxs[b]]); et.append(4)
+                        ei.append([A_off+idxs[a], A_off+idxs[b]]); et.append(5)
+
         return Data(
-            x=x, edge_index=edge_index, edge_type=edge_type,
-            node_type=node_type, pos=pos,
-            y=torch.tensor([1], dtype=torch.long),
-            phq_score=torch.tensor([10.0]),
-            phq8=torch.rand(8),
+            x          = torch.randn(N, UNIFIED_DIM),
+            edge_index = torch.tensor(ei, dtype=torch.long).t().contiguous(),
+            edge_type  = torch.tensor(et, dtype=torch.long),
+            node_type  = torch.tensor([0]*n_utt + [1]*n_utt, dtype=torch.long),
+            pos        = torch.linspace(0, 1, n_utt).repeat(2),
+            y          = torch.tensor([1], dtype=torch.long),
+            phq_score  = torch.tensor([10.0]),
+            phq8       = torch.rand(8),
         )
 
     graphs = [_make_dummy(20), _make_dummy(15)]
     batch  = Batch.from_data_list(graphs)
-
-    model = HMSGNet()
+    model  = HMSGNet()
     model.eval()
 
-    # Standard forward
     with torch.no_grad():
         dep_logit, sym_logits, phq_pred = model(batch)
+
     print(f"dep_logit:      {dep_logit.shape}")
     print(f"symptom_logits: {sym_logits.shape}")
     print(f"phq_pred:       {phq_pred.shape}")
 
-    # Routing forward (for interpretability)
-    with torch.no_grad():
-        dep_logit, sym_logits, phq_pred, rinfo = model(batch, return_routing=True)
-    print(f"routing gates (last layer): {rinfo['gates'][-1].shape}")
-    print(f"sym_edge_weights (last):    {rinfo['sym_edge_weights'][-1].shape}")
-
-    # Loss
-    dep_labels = batch.y.squeeze()
-    phq8_lbl   = torch.stack([d.phq8 for d in graphs])
-    phq_scores = batch.phq_score.squeeze()
-    loss, ld   = compute_loss(dep_logit, sym_logits, phq_pred,
-                              dep_labels, phq8_lbl, phq_scores)
+    loss, ld = compute_loss(
+        dep_logit, sym_logits, phq_pred,
+        batch.y.squeeze().float(),
+        torch.stack([d.phq8 for d in graphs]),
+        batch.phq_score.squeeze(),
+    )
     print(f"loss: {loss.item():.4f}  {ld}")
-
-    # Routing summary (single graph)
-    single = Batch.from_data_list([graphs[0]])
-    summary = model.get_symptom_routing_summary(single)
-    print("Symptom gate summary:", dict(zip(
-        summary["phq8_labels"],
-        [f"{v:.3f}" for v in summary["mean_gate_per_symptom"]]
-    )))
     print("Smoke-test PASSED.")
