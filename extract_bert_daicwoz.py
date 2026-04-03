@@ -18,6 +18,22 @@ Fixes vs original v3:
   5. [IMPROVE] Use [SEP] only when tokenizer actually has it; for models without
      NSP training (like mental-bert), use a simple " | " separator instead.
 
+  ── SHORTCUT LEARNING FIXES (v3_fixed → anti-shortcut) ──────────────────────
+  6. [FIX-SHORTCUT] --context_mode flag với 3 giá trị:
+       "none"       : chỉ participant text (no Ellie context) — gold standard
+       "truncated"  : Ellie context cắt ≤ MAX_ELLIE_WORDS (default, original behavior)
+       "full"       : full Ellie text (upper-bound shortcut baseline)
+     Ablation quan trọng: train với cả 3 modes, nếu "none" ≈ "truncated" → model
+     học genuine signals. Nếu "none" << "truncated" → shortcut learning detected.
+  7. [FIX-SHORTCUT] participant_only mode: khi context_mode="none", BERT không
+     thấy bất kỳ text nào của interviewer. Đây là setting để report trong paper.
+  8. [FIX-SHORTCUT] Export context_mode vào metadata JSON để audit sau này.
+  9. [FIX-SHORTCUT] Lưu embedding riêng theo context_mode:
+       {pid}_text_feats_ctx_none.npy
+       {pid}_text_feats_ctx_truncated.npy  (default)
+       {pid}_text_feats_ctx_full.npy
+     → Cho phép load ablation versions mà không cần re-extract tất cả.
+
 All other features (paralinguistic flags, speech rate, merge logic, pool modes)
 are preserved from v3.
 """
@@ -60,10 +76,13 @@ MIN_WORDS_FOR_EMBED = 1
 # Keep the LAST N words (the actual question), drop preamble.
 MAX_ELLIE_WORDS = 20
 
+# Valid context modes for ablation study
+CONTEXT_MODES = ("none", "truncated", "full")
+
 # Regex
-_TAG_RE = re.compile(r"<[^>]+>")
+_TAG_RE  = re.compile(r"<[^>]+>")
 _ELLIE_RE = re.compile(r"^(\S+)\s+\((.+)\)\s*$", re.DOTALL)
-_SYNC_RE = re.compile(r"^\s*<\s*synch?\s*>\s*$", re.IGNORECASE)
+_SYNC_RE  = re.compile(r"^\s*<\s*synch?\s*>\s*$", re.IGNORECASE)
 
 # Tag classification
 _SIGH_TAGS   = {"<sigh>", "<deep breath>", "<breath>"}
@@ -89,6 +108,7 @@ class UtteranceGroup:
     ellie_question_text: str = ""
     clean_text: str = ""
     context_input: str = ""
+    context_mode_used: str = "truncated"   # NEW: track which mode was used
     used_zeros: bool = False
     speech_rate_wps: float = 0.0
     has_sigh: bool = False
@@ -181,12 +201,32 @@ def truncate_ellie_text(text: str, max_words: int = MAX_ELLIE_WORDS) -> str:
 def build_context_input(
     ellie_text: str,
     participant_text: str,
+    context_mode: str,
     separator: str = " [SEP] ",
 ) -> str:
-    if ellie_text:
-        truncated = truncate_ellie_text(ellie_text)
-        return f"{truncated.strip()}{separator}{participant_text}"
-    return participant_text
+    """
+    Build the input string for BERT based on context_mode.
+
+    SHORTCUT ABLATION:
+      "none"      → participant text only (no interviewer influence)
+      "truncated" → last MAX_ELLIE_WORDS of Ellie + participant
+      "full"      → full Ellie text + participant (maximum shortcut risk)
+
+    For paper: report all 3 modes. If F1(none) ≈ F1(truncated), the model
+    learns genuine signals. If F1(none) << F1(truncated), shortcut learning.
+    """
+    if context_mode == "none" or not ellie_text:
+        return participant_text
+
+    if context_mode == "truncated":
+        ellie_part = truncate_ellie_text(ellie_text, MAX_ELLIE_WORDS)
+    elif context_mode == "full":
+        ellie_part = ellie_text.strip()
+    else:
+        raise ValueError(f"Unknown context_mode: {context_mode!r}. "
+                         f"Must be one of {CONTEXT_MODES}")
+
+    return f"{ellie_part.strip()}{separator}{participant_text}"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -267,9 +307,13 @@ def build_utterance_groups(
 
 def enrich_group(
     group: UtteranceGroup,
-    use_context: bool,
+    context_mode: str,
     separator: str = " [SEP] ",
 ) -> UtteranceGroup:
+    """
+    Enrich group with cleaned text, paralinguistic flags, speech rate,
+    and context_input based on the requested context_mode.
+    """
     # Paralinguistic flags
     combined_flags = {
         "has_sigh": False, "has_laughter": False, "has_breath": False,
@@ -286,16 +330,19 @@ def enrich_group(
     cleaned_parts = [clean_text(t) for t in group.raw_texts]
     merged_clean = " ".join(p for p in cleaned_parts if p).strip()
     group.clean_text = merged_clean
+    group.context_mode_used = context_mode
 
     if not is_substantive(merged_clean):
         group.used_zeros = True
         group.context_input = ""
         return group
 
-    # Context input with truncated Ellie text
-    group.context_input = (
-        build_context_input(group.ellie_question_text, merged_clean, separator)
-        if use_context else merged_clean
+    # Build context input according to mode
+    group.context_input = build_context_input(
+        group.ellie_question_text,
+        merged_clean,
+        context_mode=context_mode,
+        separator=separator,
     )
 
     # Speech rate
@@ -366,7 +413,7 @@ def extract_features(
     batch_size: int,
     pool_mode: str,
     merge_gap_sec: float,
-    use_context: bool,
+    context_mode: str,
     separator: str,
 ) -> tuple[np.ndarray, list[dict]]:
     df     = load_transcript(transcript_path)
@@ -376,7 +423,7 @@ def extract_features(
         log.warning(f"No participant turns in {transcript_path}")
         return np.zeros((1, EMBED_DIM), dtype=np.float32), []
 
-    groups = [enrich_group(g, use_context=use_context, separator=separator)
+    groups = [enrich_group(g, context_mode=context_mode, separator=separator)
               for g in groups]
 
     embed_groups = [g for g in groups if not g.used_zeros]
@@ -413,27 +460,35 @@ def process_participant(
     batch_size: int,
     pool_mode: str,
     merge_gap_sec: float,
-    use_context: bool,
+    context_mode: str,
     overwrite: bool,
     separator: str,
 ) -> bool:
     transcript_path = os.path.join(data_root, f"{pid}_TRANSCRIPT.csv")
-    out_npy         = os.path.join(data_root, f"{pid}_text_feats.npy")
-    out_meta        = os.path.join(data_root, f"{pid}_text_feats_meta.json")
-    out_ngroups     = os.path.join(data_root, f"{pid}_n_groups.txt")
+
+    # SHORTCUT ABLATION: embeddings saved with context_mode suffix
+    # → allows loading different ablation versions without re-extracting
+    out_npy     = os.path.join(data_root, f"{pid}_text_feats_ctx_{context_mode}.npy")
+    out_meta    = os.path.join(data_root, f"{pid}_text_feats_meta.json")   # shared
+    out_ngroups = os.path.join(data_root, f"{pid}_n_groups.txt")           # shared
 
     if not os.path.exists(transcript_path):
         log.warning(f"[{pid}] Transcript not found: {transcript_path}")
         return False
 
-    log.info(f"[{pid}] Processing …")
+    # Skip if already done (unless overwrite)
+    if not overwrite and os.path.exists(out_npy):
+        log.info(f"[{pid}] Already exists (ctx={context_mode}) — skip (use --overwrite to redo)")
+        return True
+
+    log.info(f"[{pid}] Processing (context_mode={context_mode}) …")
 
     embeddings, meta = extract_features(
         transcript_path=transcript_path,
         tokenizer=tokenizer, model=model, device=device,
         max_len=max_len, batch_size=batch_size,
         pool_mode=pool_mode, merge_gap_sec=merge_gap_sec,
-        use_context=use_context, separator=separator,
+        context_mode=context_mode, separator=separator,
     )
 
     n_groups = len(meta)
@@ -441,18 +496,51 @@ def process_participant(
     n_embed  = n_groups - n_zeros
 
     np.save(out_npy, embeddings)
-    with open(out_meta, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    # Meta JSON is shared across modes (paralinguistic flags are mode-independent)
+    # Only write if it doesn't exist yet (first mode wins; context_mode_used is
+    # stored per utterance inside the JSON for traceability)
+    if not os.path.exists(out_meta) or overwrite:
+        with open(out_meta, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
 
     # FIX: Write n_groups so dataset.py knows the correct node count
-    with open(out_ngroups, "w") as f:
-        f.write(str(n_groups))
+    if not os.path.exists(out_ngroups) or overwrite:
+        with open(out_ngroups, "w") as f:
+            f.write(str(n_groups))
 
     log.info(
-        f"[{pid}] Done — groups={n_groups} (embed={n_embed}, zeros={n_zeros}) "
+        f"[{pid}] Done (ctx={context_mode}) — "
+        f"groups={n_groups} (embed={n_embed}, zeros={n_zeros}) "
         f"| shape={embeddings.shape} → {out_npy}"
     )
     return True
+
+
+# ──────────────────────────────────────────────────────────────
+# Shortcut diagnosis helper
+# ──────────────────────────────────────────────────────────────
+def print_shortcut_reminder() -> None:
+    """Print a reminder about what to do with the 3 modes."""
+    print(
+        "\n"
+        "=" * 72 + "\n"
+        "  SHORTCUT LEARNING ABLATION GUIDE\n"
+        "=" * 72 + "\n"
+        "  Run this script 3 times with --context_mode:\n"
+        "    1) none      → {pid}_text_feats_ctx_none.npy\n"
+        "    2) truncated → {pid}_text_feats_ctx_truncated.npy  (default)\n"
+        "    3) full      → {pid}_text_feats_ctx_full.npy\n"
+        "\n"
+        "  In daicwoz_dataset.py, set TEXT_CONTEXT_MODE to load the right one.\n"
+        "\n"
+        "  Expected outcome if model is NOT shortcutting:\n"
+        "    F1(none) ≈ F1(truncated) > F1_baseline\n"
+        "\n"
+        "  Red flag (shortcut detected):\n"
+        "    F1(none) << F1(truncated)  →  model learns interviewer phrasing\n"
+        "=" * 72 + "\n"
+    )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -484,7 +572,7 @@ def get_hf_token(cli_token=None, env_file=".env") -> Optional[str]:
 # ──────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract BERT embeddings từ DAIC-WOZ transcripts (v3-fixed)"
+        description="Extract BERT embeddings từ DAIC-WOZ transcripts (v3-fixed, anti-shortcut)"
     )
     parser.add_argument("--data_root",    default="daicwoz/")
     parser.add_argument("--split_csv",    required=True)
@@ -495,20 +583,42 @@ def main():
     parser.add_argument("--pool_mode",    default="mean_top4",
                         choices=["mean_last", "cls", "mean_top4"])
     parser.add_argument("--merge_gap",    type=float, default=DEFAULT_MERGE_GAP_SEC)
-    parser.add_argument("--no_context",   action="store_true")
+
+    # ── SHORTCUT ABLATION FLAG ────────────────────────────────────────────────
+    parser.add_argument(
+        "--context_mode",
+        default="truncated",
+        choices=list(CONTEXT_MODES),
+        help=(
+            "How to handle Ellie (interviewer) context for BERT input.\n"
+            "  none      : participant text only — RECOMMENDED for anti-shortcut\n"
+            "  truncated : last 20 words of Ellie + participant (default)\n"
+            "  full      : entire Ellie turn + participant (max shortcut risk)\n"
+            "Run all 3 and compare F1 in ablation table."
+        ),
+    )
+    # ── END SHORTCUT ABLATION FLAG ───────────────────────────────────────────
+
     parser.add_argument("--overwrite",    action="store_true")
+    parser.add_argument(
+        "--all_modes",
+        action="store_true",
+        help="Extract all 3 context modes in one run (for ablation convenience).",
+    )
     args = parser.parse_args()
 
-    use_context = not args.no_context
-    device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Decide which modes to run
+    modes_to_run = list(CONTEXT_MODES) if args.all_modes else [args.context_mode]
 
     log.info(f"Device      : {device}")
     log.info(f"Model       : {args.model_name}")
     log.info(f"Pool mode   : {args.pool_mode}")
     log.info(f"Merge gap   : {args.merge_gap}s")
-    log.info(f"Context win : {use_context}")
+    log.info(f"Context mode: {modes_to_run}")
     log.info(f"Min words   : {MIN_WORDS_FOR_EMBED}")
-    log.info(f"Max ellie   : {MAX_ELLIE_WORDS} words")
+    log.info(f"Max ellie   : {MAX_ELLIE_WORDS} words (truncated mode)")
 
     hf_token  = get_hf_token(args.hf_token)
     hf_kwargs = {"token": hf_token} if hf_token else {}
@@ -529,20 +639,25 @@ def main():
     pids = split_df["Participant_ID"].astype(int).tolist()
     log.info(f"Participants: {len(pids)}")
 
-    success = 0
-    for pid in pids:
-        ok = process_participant(
-            pid=pid, data_root=args.data_root,
-            tokenizer=tokenizer, model=model, device=device,
-            max_len=args.max_len, batch_size=args.batch_size,
-            pool_mode=args.pool_mode, merge_gap_sec=args.merge_gap,
-            use_context=use_context, overwrite=args.overwrite,
-            separator=separator,
-        )
-        if ok:
-            success += 1
+    for mode in modes_to_run:
+        log.info(f"\n{'='*60}")
+        log.info(f"  Extracting context_mode = {mode!r}")
+        log.info(f"{'='*60}")
+        success = 0
+        for pid in pids:
+            ok = process_participant(
+                pid=pid, data_root=args.data_root,
+                tokenizer=tokenizer, model=model, device=device,
+                max_len=args.max_len, batch_size=args.batch_size,
+                pool_mode=args.pool_mode, merge_gap_sec=args.merge_gap,
+                context_mode=mode, overwrite=args.overwrite,
+                separator=separator,
+            )
+            if ok:
+                success += 1
+        log.info(f"Mode={mode}: {success}/{len(pids)} participants done.")
 
-    log.info(f"\nDone: {success}/{len(pids)} participants.")
+    print_shortcut_reminder()
 
 
 if __name__ == "__main__":

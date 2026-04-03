@@ -1,22 +1,39 @@
 """
 train.py
 
-Training script for HMSG-Net.
+Training script for HMSG-Net on DAIC-WOZ.
 
 Configuration constants are defined at the top of this file.
-Run with:
-    python train.py                    # default: E-DAIC
-    python train.py --dataset daicwoz  # DAIC-WOZ corpus
-    python train.py --dataset edaic    # E-DAIC corpus (explicit)
+
+Run:
+    python train.py --dataset daicwoz
+    python train.py --dataset daicwoz --context_mode none       # anti-shortcut
+    python train.py --dataset daicwoz --context_mode full       # shortcut baseline
+    python train.py --dataset daicwoz --multi_seed              # variance report
+
+FIXES vs original:
+  1. [FIX-SHORTCUT]     --context_mode flag: none / truncated / full
+                        Passes to DaicWozDataset, ablates interviewer influence.
+  2. [FIX-VARIANCE]     --multi_seed flag: train with N seeds (default 5),
+                        report mean ± std for F1/AUC. Required for small datasets.
+  3. [FIX-VARIANCE]     Per-run JSON log with full metrics per epoch → easy to
+                        aggregate results across seeds in post-hoc analysis.
+  4. [FIX-THRESHOLD]    find_best_threshold now constrained to [0.30, 0.70] with
+                        step 0.02. On dev sets of ~35 samples a wider sweep
+                        overfits to noise → meaningless thresholds.
+  5. [FIX-REPORTING]    print_final_summary() prints a paper-ready table with
+                        mean±std across seeds for all key metrics.
+  6. [FIX-EDAIC-STUB]   E-DAIC config kept but clearly marked TODO for future.
 """
 
 import argparse
+import json
 import math
 import os
 import random
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -33,7 +50,6 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
 from torch_geometric.loader import DataLoader
 
-from edaic_dataset import DepressionDataset
 from daicwoz_dataset import DaicWozDataset
 from model import HMSGNet, compute_loss
 
@@ -41,65 +57,56 @@ from model import HMSGNet, compute_loss
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Reproducibility
-SEED = 42
+BASE_SEED  = 42
+MULTI_SEEDS = [42, 123, 456, 789, 2024]   # 5 seeds for variance reporting
 
-# Dataset-specific settings (keyed by --dataset value)
-# Each entry fully specifies model arch, training HP, and feature dims.
 DATASET_CFG = {
+    # ── E-DAIC (TODO: implement after DAIC-WOZ is solid) ──────────────────────
     "edaic": {
-        # Paths
         "cache_dir":      "C:/Users/Administrator/Desktop/thgnn/cache",
         "checkpoint_dir": Path("C:/Users/Administrator/Desktop/thgnn/checkpoints"),
-        # Feature dims (2-modal: BERT text + wav2vec audio)
         "text_dim":  768,
-        "audio_dim": 768,   # wav2vec2
-        # Model
+        "audio_dim": 768,
         "hidden_dim":      256,
         "num_gnn_layers":  3,
         "n_heads":         4,
         "dropout":         0.35,
         "drop_edge":       0.10,
         "feat_noise":      0.02,
-        # Loss
-        "focal_alpha":     0.80,   # E-DAIC ~21% positive — upweight heavily
+        "focal_alpha":     0.80,
         "w_symptom":       0.3,
         "w_phq":           0.1,
-        # Optimiser
         "lr":              3e-4,
         "weight_decay":    2e-4,
-        # Scheduler
         "warmup_epochs":   5,
         "cosine_epochs":   250,
         "eta_min":         1e-6,
-        # Training loop
         "batch_size":      8,
         "max_epochs":      250,
         "early_stop_pat":  30,
     },
+    # ── DAIC-WOZ ────────────────────────────────────────────────────────────
     "daicwoz": {
-        # Paths
         "cache_dir":      "C:/Users/Administrator/Desktop/thgnn/cache_daicwoz",
         "checkpoint_dir": Path("C:/Users/Administrator/Desktop/thgnn/checkpoints_daicwoz"),
-        # Feature dims — BERT(768) + prosodic(8) per modality
-        "text_dim":  776,
-        "audio_dim": 776,
-        # Tiny model: 107 samples cannot support large capacity
+        "text_dim":  776,    # BERT(768) + prosodic(8)
+        "audio_dim": 776,    # wav2vec(768) + acoustic(8)
+        # Tiny model justified by ~107 training samples
         "hidden_dim":      64,
         "num_gnn_layers":  1,
-        "n_heads":         2,      # head_dim = 32
+        "n_heads":         2,   # head_dim = 32
         "dropout":         0.70,
         "drop_edge":       0.40,
         "feat_noise":      0.05,
-        # Loss — pure dep focal, aux losses add noise with this few samples
+        # Loss — pure dep focal; aux losses add noise with few samples
         "focal_alpha":     0.75,
         "label_smoothing": 0.05,
         "w_symptom":       0.0,
         "w_phq":           0.0,
-        # Optimiser — very low constant LR avoids the epoch-3 overshoot pattern
+        # Optimiser
         "lr":              5e-5,
         "weight_decay":    5e-3,
-        # Scheduler — 1-epoch warmup (lambda(0)=1.0, effectively no ramp), gentle cosine
+        # Scheduler
         "warmup_epochs":   1,
         "cosine_epochs":   300,
         "eta_min":         1e-7,
@@ -111,12 +118,10 @@ DATASET_CFG = {
     },
 }
 
-# Kept for backward-compat reference; actual values come from DATASET_CFG
 NUM_SYMPTOMS   = 8
-NUM_EDGE_TYPES = 4   # dataset builds exactly 4 edge types: T→T, A→A, T→A, A→T
+NUM_EDGE_TYPES = 4
 MAX_GRAD_NORM  = 1.0
 
-# Device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -139,13 +144,18 @@ def set_seed(seed: int) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def find_best_threshold(labels: np.ndarray, probs: np.ndarray) -> float:
-    """Sweep thresholds [0.30, 0.70] and return the one maximising F1-macro.
-    Range is intentionally constrained: on small dev sets (≤50 samples) a wider
-    sweep will overfit to noise and return clinically meaningless thresholds
-    (e.g. 0.10 that predicts nearly all positive).
+    """
+    FIX-THRESHOLD: Sweep [0.30, 0.70] with step 0.02 and return the threshold
+    that maximises F1-macro.
+
+    The range is INTENTIONALLY constrained:
+    - On small dev sets (~35 samples) a wider sweep [0.10, 0.90] overfits to
+      noise, returning thresholds like 0.12 that predict nearly all positive.
+    - The constrained range forces the model to learn a well-calibrated score
+      rather than relying on threshold tricks.
     """
     best_thr, best_f1 = 0.5, 0.0
-    for thr in np.arange(0.20, 0.81, 0.02):
+    for thr in np.arange(0.30, 0.71, 0.02):
         preds = (probs >= thr).astype(int)
         f1 = f1_score(labels, preds, average="macro", zero_division=0)
         if f1 > best_f1:
@@ -158,12 +168,11 @@ def compute_metrics(
     probs:  np.ndarray,
     threshold: float = 0.5,
 ) -> Dict[str, float]:
-    """Compute classification metrics from predicted probabilities."""
     preds = (probs >= threshold).astype(int)
     metrics: Dict[str, float] = {}
     metrics["accuracy"]    = accuracy_score(labels, preds)
-    metrics["f1_macro"]    = f1_score(labels, preds, average="macro",     zero_division=0)
-    metrics["f1_weighted"] = f1_score(labels, preds, average="weighted",  zero_division=0)
+    metrics["f1_macro"]    = f1_score(labels, preds, average="macro",    zero_division=0)
+    metrics["f1_weighted"] = f1_score(labels, preds, average="weighted", zero_division=0)
     metrics["precision"]   = precision_score(labels, preds, zero_division=0)
     metrics["recall"]      = recall_score(labels, preds, zero_division=0)
     metrics["threshold"]   = threshold
@@ -171,11 +180,23 @@ def compute_metrics(
         metrics["auc"] = roc_auc_score(labels, probs)
     except ValueError:
         metrics["auc"] = float("nan")
+
+    # Confusion matrix — useful for clinical analysis (FP/FN tradeoff)
+    cm = confusion_matrix(labels, preds, labels=[0, 1])
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        metrics["tp"] = int(tp)
+        metrics["tn"] = int(tn)
+        metrics["fp"] = int(fp)
+        metrics["fn"] = int(fn)
+        metrics["sensitivity"] = float(tp / max(tp + fn, 1))  # same as recall
+        metrics["specificity"] = float(tn / max(tn + fp, 1))
+
     return metrics
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# One epoch (train or eval)
+# One epoch
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_epoch(
@@ -189,15 +210,6 @@ def run_epoch(
     focal_alpha:     float = 0.80,
     label_smoothing: float = 0.0,
 ) -> Tuple[Dict[str, float], np.ndarray, np.ndarray]:
-    """
-    Run one full pass over `loader`.
-
-    Returns
-    -------
-    loss_dict  : dict with averaged loss components
-    all_labels : (N,) integer array
-    all_probs  : (N,) float array of sigmoid probabilities
-    """
     if is_train:
         model.train()
     else:
@@ -241,10 +253,8 @@ def run_epoch(
                 total_losses[k] += ld.get(k, 0.0)
             n_batches += 1
 
-            probs = torch.sigmoid(dep_logit).detach().cpu().numpy()
-            lbls  = dep_labels.detach().cpu().numpy()
-            all_probs.extend(probs.tolist())
-            all_labels.extend(lbls.tolist())
+            all_probs.extend(torch.sigmoid(dep_logit).detach().cpu().numpy().tolist())
+            all_labels.extend(dep_labels.detach().cpu().numpy().tolist())
 
     if n_batches > 0:
         for k in total_losses:
@@ -258,7 +268,7 @@ def run_epoch(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scheduler factory: linear warmup → cosine annealing
+# Scheduler
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_scheduler(
@@ -267,120 +277,76 @@ def build_scheduler(
     num_cosine_epochs: int,
     eta_min:           float = 1e-6,
 ) -> torch.optim.lr_scheduler._LRScheduler:
-    """
-    Builds a SequentialLR composed of:
-      1. Linear warmup from 0 → 1 over `num_warmup_epochs` epochs.
-      2. CosineAnnealingLR for `num_cosine_epochs` epochs.
-    """
     def warmup_lambda(epoch: int) -> float:
         if epoch < num_warmup_epochs:
             return float(epoch + 1) / float(max(1, num_warmup_epochs))
         return 1.0
 
-    warmup_sched  = LambdaLR(optimizer, lr_lambda=warmup_lambda)
-    cosine_sched  = CosineAnnealingLR(
-        optimizer, T_max=num_cosine_epochs, eta_min=eta_min
-    )
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup_sched, cosine_sched],
-        milestones=[num_warmup_epochs],
-    )
-    return scheduler
+    warmup_sched = LambdaLR(optimizer, lr_lambda=warmup_lambda)
+    cosine_sched = CosineAnnealingLR(optimizer, T_max=num_cosine_epochs, eta_min=eta_min)
+    return SequentialLR(optimizer,
+                        schedulers=[warmup_sched, cosine_sched],
+                        milestones=[num_warmup_epochs])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Checkpoint helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_checkpoint(
-    model:     HMSGNet,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    epoch:     int,
-    best_f1:   float,
-    path:      Path,
-) -> None:
-    torch.save(
-        {
-            "epoch":      epoch,
-            "best_f1":    best_f1,
-            "model_state_dict":     model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-        },
-        str(path),
-    )
+def save_checkpoint(model, optimizer, scheduler, epoch, best_metric, path):
+    torch.save({
+        "epoch": epoch, "best_metric": best_metric,
+        "model_state_dict":     model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+    }, str(path))
 
 
-def load_checkpoint(
-    model:     HMSGNet,
-    optimizer: Optional[torch.optim.Optimizer],
-    scheduler,
-    path:      Path,
-    device:    torch.device,
-) -> Tuple[int, float]:
-    """Load checkpoint and return (start_epoch, best_f1)."""
+def load_checkpoint(model, optimizer, scheduler, path, device):
     ckpt = torch.load(str(path), map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
-    if optimizer is not None and "optimizer_state_dict" in ckpt:
+    if optimizer and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    if scheduler is not None and "scheduler_state_dict" in ckpt:
+    if scheduler and "scheduler_state_dict" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    return ckpt.get("epoch", 0), ckpt.get("best_f1", 0.0)
+    return ckpt.get("epoch", 0), ckpt.get("best_metric", 0.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Logging helper
+# Logging
 # ─────────────────────────────────────────────────────────────────────────────
 
-def log_epoch(
-    epoch:       int,
-    phase:       str,
-    losses:      Dict[str, float],
-    metrics:     Dict[str, float],
-    lr:          float,
-    elapsed:     float,
-) -> None:
+def log_epoch(epoch, phase, losses, metrics, lr, elapsed):
     print(
         f"[Epoch {epoch:03d}] {phase:5s} | "
-        f"loss={losses['loss_total']:.4f} "
-        f"(dep={losses['loss_dep']:.4f} "
-        f"sym={losses['loss_symptom']:.4f} "
-        f"phq={losses['loss_phq']:.4f}) | "
+        f"loss={losses['loss_total']:.4f} | "
         f"acc={metrics.get('accuracy', 0):.4f} "
         f"f1_macro={metrics.get('f1_macro', 0):.4f} "
-        f"f1_w={metrics.get('f1_weighted', 0):.4f} "
-        f"prec={metrics.get('precision', 0):.4f} "
-        f"rec={metrics.get('recall', 0):.4f} "
         f"auc={metrics.get('auc', float('nan')):.4f} "
+        f"sens={metrics.get('sensitivity', 0):.4f} "
+        f"spec={metrics.get('specificity', 0):.4f} "
         f"thr={metrics.get('threshold', 0.5):.2f} | "
         f"lr={lr:.2e} | {elapsed:.1f}s"
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main training loop
+# Single-seed training run
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train HMSG-Net")
-    parser.add_argument(
-        "--dataset",
-        choices=["edaic", "daicwoz"],
-        default="edaic",
-        help="Dataset to train on: 'edaic' (default) or 'daicwoz'",
-    )
-    parser.add_argument(
-        "--force-reload",
-        action="store_true",
-        help="Re-process dataset from scratch (clears cache)",
-    )
-    args = parser.parse_args()
+def train_one_seed(
+    cfg: dict,
+    seed: int,
+    dataset_name: str,
+    context_mode: str,
+    run_log_path: Optional[Path] = None,
+) -> Dict[str, float]:
+    """
+    Train one full run with the given seed.
+    Returns best dev metrics dict.
+    """
+    set_seed(seed)
 
-    cfg = DATASET_CFG[args.dataset]
-
-    # ── Unpack all config values ──────────────────────────────────────────────
     cache_dir      = cfg["cache_dir"]
     checkpoint_dir = cfg["checkpoint_dir"]
     text_dim       = cfg["text_dim"]
@@ -405,56 +371,51 @@ def main() -> None:
     max_epochs     = cfg["max_epochs"]
     early_stop_pat = cfg["early_stop_pat"]
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    best_model_path = checkpoint_dir / "best_model.pt"
+    # Seed-specific checkpoint to avoid collisions in multi-seed run
+    ckpt_dir = Path(checkpoint_dir) / f"ctx_{context_mode}" / f"seed_{seed}"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_model_path = ckpt_dir / "best_model.pt"
 
-    set_seed(SEED)
-    print(f"Dataset: {args.dataset}  |  Device: {DEVICE}")
+    print(f"\n{'='*60}")
+    print(f"  SEED={seed}  context_mode={context_mode!r}  dataset={dataset_name}")
+    print(f"{'='*60}")
 
-    # ── Datasets & loaders ────────────────────────────────────────────────────
-    print("Loading datasets …")
-    if args.dataset == "edaic":
-        train_ds = DepressionDataset(split="train", root=cache_dir,
-                                     force_reload=args.force_reload)
-        dev_ds   = DepressionDataset(split="dev",   root=cache_dir,
-                                     force_reload=args.force_reload)
-    else:
-        train_ds = DaicWozDataset(split="train", root=cache_dir,
-                                   force_reload=args.force_reload)
-        dev_ds   = DaicWozDataset(split="dev",   root=cache_dir,
-                                   force_reload=args.force_reload)
+    # ── Datasets ──────────────────────────────────────────────────────────────
+    train_ds = DaicWozDataset(
+        split="train", root=cache_dir, context_mode=context_mode
+    )
+    dev_ds = DaicWozDataset(
+        split="dev", root=cache_dir, context_mode=context_mode
+    )
 
     if use_weighted_sampler:
         from torch.utils.data import WeightedRandomSampler
         labels_arr  = train_ds.labels().numpy()
         class_count = np.bincount(labels_arr)
-        sample_w    = (1.0 / class_count)[labels_arr]   # per-sample weight
+        sample_w    = (1.0 / class_count)[labels_arr]
         sampler     = WeightedRandomSampler(
             weights=torch.from_numpy(sample_w).float(),
-            num_samples=len(train_ds),
-            replacement=True,
+            num_samples=len(train_ds), replacement=True,
         )
         train_loader = DataLoader(
             train_ds, batch_size=batch_size, sampler=sampler,
-            num_workers=0, pin_memory=(DEVICE.type == "cuda"), drop_last=False,
+            num_workers=0, pin_memory=(DEVICE.type == "cuda"),
         )
     else:
         train_loader = DataLoader(
             train_ds, batch_size=batch_size, shuffle=True,
-            num_workers=0, pin_memory=(DEVICE.type == "cuda"), drop_last=False,
+            num_workers=0, pin_memory=(DEVICE.type == "cuda"),
         )
+
     dev_loader = DataLoader(
-        dev_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=(DEVICE.type == "cuda"),
-        drop_last=False,
+        dev_ds, batch_size=batch_size, shuffle=False,
+        num_workers=0, pin_memory=(DEVICE.type == "cuda"),
     )
 
-    print(f"  Train: {len(train_ds)} graphs,  Dev: {len(dev_ds)} graphs")
     label_counts = torch.bincount(train_ds.labels())
-    print(f"  Train class distribution: neg={label_counts[0]}, pos={label_counts[1]}")
+    print(f"  Train: {len(train_ds)} graphs | "
+          f"neg={label_counts[0]}, pos={label_counts[1]}")
+    print(f"  Dev:   {len(dev_ds)} graphs")
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = HMSGNet(
@@ -470,45 +431,21 @@ def main() -> None:
         audio_dim=audio_dim,
     ).to(DEVICE)
 
-    unified_dim = text_dim + audio_dim
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Model parameters: {n_params:,}  (unified_dim={unified_dim})")
-    print(f"  focal_alpha={focal_alpha}  label_smooth={label_smoothing}  "
-          f"dropout={dropout}  drop_edge={drop_edge}  lr={lr:.1e}  "
-          f"batch={batch_size}  patience={early_stop_pat}  "
-          f"weighted_sampler={use_weighted_sampler}")
+    print(f"  Params: {n_params:,}  dropout={dropout}  drop_edge={drop_edge}")
 
-    # ── Optimiser & scheduler ─────────────────────────────────────────────────
-    optimizer = AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-    scheduler = build_scheduler(
-        optimizer,
-        num_warmup_epochs=warmup_epochs,
-        num_cosine_epochs=cosine_epochs,
-        eta_min=eta_min,
-    )
-
-    # Resume if checkpoint exists (skip when force-reload clears data)
-    start_epoch = 1
-    best_dev_f1 = 0.0
-    if best_model_path.exists() and not args.force_reload:
-        print(f"  Resuming from checkpoint: {best_model_path}")
-        start_epoch, best_dev_f1 = load_checkpoint(
-            model, optimizer, scheduler, best_model_path, DEVICE
-        )
-        start_epoch += 1
-        print(f"  Resuming at epoch {start_epoch}, best_dev_f1={best_dev_f1:.4f}")
-
-    no_improve_count = 0
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = build_scheduler(optimizer, warmup_epochs, cosine_epochs, eta_min)
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    for epoch in range(start_epoch, max_epochs + 1):
+    best_dev_auc     = 0.0
+    best_dev_metrics = {}
+    no_improve_count = 0
+    epoch_log        = []
+
+    for epoch in range(1, max_epochs + 1):
         t0 = time.time()
 
-        # --- Train ---
         train_losses, train_labels, train_probs = run_epoch(
             model, train_loader, optimizer, DEVICE, is_train=True,
             w_symptom=w_symptom, w_phq=w_phq, focal_alpha=focal_alpha,
@@ -519,53 +456,230 @@ def main() -> None:
         log_epoch(epoch, "TRAIN", train_losses, train_metrics, lr_now,
                   time.time() - t0)
 
-        # --- Dev (with threshold optimisation) ---
         t1 = time.time()
         dev_losses, dev_labels, dev_probs = run_epoch(
             model, dev_loader, None, DEVICE, is_train=False,
             w_symptom=w_symptom, w_phq=w_phq, focal_alpha=focal_alpha,
-            label_smoothing=0.0,   # no smoothing at eval
+            label_smoothing=0.0,
         )
-        best_thr = find_best_threshold(dev_labels, dev_probs)
+        # FIX-THRESHOLD: constrained sweep
+        best_thr    = find_best_threshold(dev_labels, dev_probs)
         dev_metrics = compute_metrics(dev_labels, dev_probs, threshold=best_thr)
         log_epoch(epoch, "DEV", dev_losses, dev_metrics, lr_now,
                   time.time() - t1)
 
         scheduler.step()
 
-        # --- Early stopping & checkpointing ---
-        # Use AUC as primary criterion: more robust than threshold-optimised F1
-        # on small dev sets (35 samples), where threshold search can overfit.
-        dev_f1  = dev_metrics.get("f1_macro", 0.0)
+        # Primary criterion: AUC (more robust than threshold-optimised F1
+        # on ~35-sample dev sets)
         dev_auc = dev_metrics.get("auc", 0.0)
-        if dev_auc > best_dev_f1:   # best_dev_f1 now tracks best AUC
-            best_dev_f1 = dev_auc
+        if not math.isnan(dev_auc) and dev_auc > best_dev_auc:
+            best_dev_auc     = dev_auc
+            best_dev_metrics = {**dev_metrics, "epoch": epoch}
             no_improve_count = 0
-            ckpt_data = {
-                "epoch": epoch, "best_auc": best_dev_f1, "best_f1": dev_f1,
-                "best_threshold": best_thr,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-            }
-            torch.save(ckpt_data, str(best_model_path))
-            print(f"  * New best dev AUC={best_dev_f1:.4f} "
-                  f"(F1={dev_f1:.4f} thr={best_thr:.2f}) -> saved")
+            save_checkpoint(model, optimizer, scheduler, epoch,
+                            best_dev_auc, best_model_path)
+            print(f"  * New best AUC={best_dev_auc:.4f} "
+                  f"(F1={dev_metrics.get('f1_macro', 0):.4f} "
+                  f"thr={best_thr:.2f}) → saved")
         else:
             no_improve_count += 1
             print(f"  No improvement ({no_improve_count}/{early_stop_pat}). "
-                  f"Best dev AUC = {best_dev_f1:.4f}")
+                  f"Best AUC={best_dev_auc:.4f}")
             if no_improve_count >= early_stop_pat:
-                print(f"Early stopping triggered at epoch {epoch}.")
+                print(f"  Early stopping at epoch {epoch}.")
                 break
 
-    print(f"\nTraining complete. Best dev AUC = {best_dev_f1:.4f}")
-    print(f"Best model saved at: {best_model_path}")
+        # Per-epoch log entry
+        epoch_log.append({
+            "epoch": epoch, "seed": seed, "context_mode": context_mode,
+            "train_loss": train_losses["loss_total"],
+            "dev_loss":   dev_losses["loss_total"],
+            "dev_auc":    dev_auc,
+            "dev_f1_macro": dev_metrics.get("f1_macro", 0.0),
+        })
+
+    # Write per-run epoch log
+    if run_log_path is not None:
+        run_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(run_log_path, "w") as f:
+            json.dump({"seed": seed, "context_mode": context_mode,
+                       "best": best_dev_metrics, "epochs": epoch_log}, f, indent=2)
+        print(f"  Run log saved: {run_log_path}")
+
+    print(f"  [Seed {seed}] Done. Best dev AUC={best_dev_auc:.4f}  "
+          f"F1={best_dev_metrics.get('f1_macro', 0):.4f}")
+    return best_dev_metrics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-seed variance reporting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_multi_seed(
+    cfg: dict,
+    seeds: List[int],
+    dataset_name: str,
+    context_mode: str,
+    log_dir: Path,
+) -> None:
+    """
+    FIX-VARIANCE: Train with multiple seeds and print mean ± std.
+    Required for credible reporting on small datasets like DAIC-WOZ (107 samples).
+    """
+    all_metrics: List[Dict] = []
+
+    for seed in seeds:
+        log_path = log_dir / f"run_ctx_{context_mode}_seed_{seed}.json"
+        metrics  = train_one_seed(cfg, seed, dataset_name, context_mode, log_path)
+        all_metrics.append(metrics)
+
+    print_multi_seed_summary(all_metrics, seeds, context_mode)
+
+    # Save aggregate report
+    agg_path = log_dir / f"aggregate_ctx_{context_mode}.json"
+    with open(agg_path, "w") as f:
+        json.dump({"context_mode": context_mode, "seeds": seeds,
+                   "runs": all_metrics}, f, indent=2)
+    print(f"\nAggregate report: {agg_path}")
+
+
+def print_multi_seed_summary(
+    all_metrics: List[Dict],
+    seeds: List[int],
+    context_mode: str,
+) -> None:
+    """Print a paper-ready table of mean ± std across seeds."""
+    keys = ["auc", "f1_macro", "f1_weighted", "precision", "recall",
+            "sensitivity", "specificity", "accuracy"]
+
+    print(f"\n{'='*72}")
+    print(f"  MULTI-SEED SUMMARY  |  context_mode={context_mode!r}  "
+          f"|  seeds={seeds}")
+    print(f"{'='*72}")
+    print(f"  {'Metric':<20} {'Mean':>8} {'Std':>8} {'Min':>8} {'Max':>8}")
+    print(f"  {'-'*52}")
+    for key in keys:
+        vals = [m.get(key, float("nan")) for m in all_metrics]
+        vals_clean = [v for v in vals if not math.isnan(v)]
+        if not vals_clean:
+            print(f"  {key:<20} {'N/A':>8}")
+            continue
+        mn = np.mean(vals_clean)
+        sd = np.std(vals_clean)
+        lo = np.min(vals_clean)
+        hi = np.max(vals_clean)
+        print(f"  {key:<20} {mn:>8.4f} {sd:>8.4f} {lo:>8.4f} {hi:>8.4f}")
+    print(f"{'='*72}\n")
+
+
+def print_shortcut_ablation_reminder() -> None:
+    """Print guide for interpreting ablation results."""
+    print(
+        "\n"
+        "=" * 72 + "\n"
+        "  HOW TO INTERPRET SHORTCUT LEARNING ABLATION\n"
+        "=" * 72 + "\n"
+        "  Run all 3 modes and compare mean AUC / F1-macro:\n"
+        "\n"
+        "  --context_mode none      → BERT sees only participant text\n"
+        "  --context_mode truncated → + last 20 words of Ellie question\n"
+        "  --context_mode full      → + full Ellie turn\n"
+        "\n"
+        "  GOOD (no shortcut): F1(none) ≈ F1(truncated) > baseline\n"
+        "  BAD  (shortcut):    F1(none) << F1(truncated)\n"
+        "\n"
+        "  If shortcut detected:\n"
+        "    → Report both numbers in paper (honest evaluation)\n"
+        "    → Use context_mode=none as your primary result\n"
+        "    → Discuss as limitation / future work\n"
+        "=" * 72 + "\n"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train HMSG-Net")
+    parser.add_argument(
+        "--dataset", choices=["daicwoz"], default="daicwoz",
+        help="Dataset to train on. (E-DAIC: TODO for future work)"
+    )
+    parser.add_argument(
+        "--context_mode",
+        default="truncated",
+        choices=["none", "truncated", "full"],
+        help=(
+            "BERT context mode for shortcut learning ablation.\n"
+            "  none      : participant text only (anti-shortcut, recommended)\n"
+            "  truncated : + last 20 words of Ellie question (default)\n"
+            "  full      : + full Ellie turn (shortcut upper-bound)\n"
+            "Run all 3 and compare F1 / AUC for ablation table in paper."
+        ),
+    )
+    parser.add_argument(
+        "--multi_seed",
+        action="store_true",
+        help=(
+            "Train with multiple seeds and report mean ± std. "
+            "REQUIRED for credible reporting on DAIC-WOZ (~107 train samples). "
+            f"Seeds used: {MULTI_SEEDS}"
+        ),
+    )
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Override seeds for multi-seed run (e.g. --seeds 42 123 456)",
+    )
+    parser.add_argument(
+        "--log_dir",
+        default=None,
+        help="Directory to save per-run JSON logs (default: checkpoint_dir/logs)",
+    )
+    parser.add_argument(
+        "--force_reload",
+        action="store_true",
+        help="Re-process dataset cache from scratch.",
+    )
+    args = parser.parse_args()
+
+    cfg = DATASET_CFG[args.dataset]
+
+    log_dir = (
+        Path(args.log_dir)
+        if args.log_dir
+        else Path(cfg["checkpoint_dir"]) / "logs"
+    )
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Dataset      : {args.dataset}")
+    print(f"Context mode : {args.context_mode}")
+    print(f"Multi-seed   : {args.multi_seed}")
+    print(f"Device       : {DEVICE}")
+    print(f"Log dir      : {log_dir}")
+
+    if args.multi_seed:
+        seeds = args.seeds if args.seeds else MULTI_SEEDS
+        run_multi_seed(cfg, seeds, args.dataset, args.context_mode, log_dir)
+        print_shortcut_ablation_reminder()
+    else:
+        seed     = args.seeds[0] if args.seeds else BASE_SEED
+        log_path = log_dir / f"run_ctx_{args.context_mode}_seed_{seed}.json"
+        metrics  = train_one_seed(
+            cfg, seed, args.dataset, args.context_mode, log_path
+        )
+        print(f"\nFinal best dev metrics:")
+        for k, v in sorted(metrics.items()):
+            if isinstance(v, float):
+                print(f"  {k:<20}: {v:.4f}")
+            else:
+                print(f"  {k:<20}: {v}")
+        print_shortcut_ablation_reminder()
+
 
 if __name__ == "__main__":
     main()
