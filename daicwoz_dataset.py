@@ -490,7 +490,7 @@ class DaicWozDataset(InMemoryDataset):
 
     @property
     def class_weights(self) -> torch.Tensor:
-        labels = torch.stack([d.y.squeeze() for d in self], dim=0).float()
+        labels = torch.cat([d.y.reshape(-1) for d in self], dim=0).float()
         n_pos  = labels.sum().item()
         n_neg  = (1 - labels).sum().item()
         total  = n_pos + n_neg

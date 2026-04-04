@@ -39,7 +39,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torchaudio
-from transformers import AutoProcessor, WavLMModel
+from transformers import AutoFeatureExtractor, WavLMModel
 
 try:
     import librosa
@@ -285,17 +285,34 @@ def embed_segments_batched(
                 )
                 hidden_states = list(outputs.hidden_states)
 
-            # FIX: use layers 6-11 (upper-mid), uniform mean
+            # use layers 6-11 (upper-mid), uniform mean
             selected_layers = hidden_states[WAVLM_LAYER_START:WAVLM_LAYER_END]
             stacked = torch.stack(selected_layers, dim=0)   # (K, B, T, H)
             merged  = stacked.mean(dim=0)                   # (B, T, H)
 
-            # Mean-pool over time with attention mask
+            # FIX: attention_mask is in sample-space (B, S) but merged is in
+            # frame-space (B, T) where T = S / 320 (WavLM CNN downsampling).
+            # Direct multiplication (B,T,H) * (B,S,1) causes shape error.
+            # Convert to frame-space first using model's own utility method
+            # which correctly handles WavLM's multi-layer CNN stride.
+            T = merged.size(1)
             if attention_mask is not None:
-                mask   = attention_mask.unsqueeze(-1).float()
+                if hasattr(model, "_get_feature_vector_attention_mask"):
+                    # Official HF API — exact frame lengths per batch item
+                    frame_mask = model._get_feature_vector_attention_mask(
+                        T, attention_mask
+                    ).to(merged.device)                      # (B, T) bool
+                else:
+                    # Fallback: approximate via WavLM CNN stride = 320
+                    lengths      = attention_mask.sum(dim=-1).long()
+                    frame_lengths = (lengths.float() / 320).floor().long().clamp(max=T)
+                    idx          = torch.arange(T, device=merged.device).unsqueeze(0)
+                    frame_mask   = idx < frame_lengths.unsqueeze(1)  # (B, T)
+
+                mask   = frame_mask.unsqueeze(-1).float()    # (B, T, 1)
                 pooled = (merged * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
             else:
-                pooled = merged.mean(dim=1)
+                pooled = merged.mean(dim=1)                  # (B, H)
 
             batch_embs = pooled.cpu().numpy().astype(np.float32)
             for j, orig_idx in enumerate(batch_idx):
@@ -565,6 +582,24 @@ def main():
     device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_fp16 = args.fp16 and device.type == "cuda"
 
+    if device.type == "cuda":
+        # TF32: cho phép cuDNN dùng Tensor Float 32 trên Ampere/Ada Lovelace
+        # Fix warning "CUDNN_STATUS_NOT_SUPPORTED" với conv1d
+        torch.backends.cudnn.allow_tf32       = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        # benchmark: cuDNN tự chọn kernel tối ưu cho hardware hiện tại
+        torch.backends.cudnn.benchmark = True
+
+    import warnings
+    warnings.filterwarnings("ignore", message="Support for mismatched key_padding_mask",
+                            category=UserWarning)
+    warnings.filterwarnings("ignore", message=".*flash attention.*",
+                            category=UserWarning)
+    warnings.filterwarnings("ignore", message=".*cudnnException.*",
+                            category=UserWarning)
+    warnings.filterwarnings("ignore", message=".*Plan failed with a cudnnException.*",
+                            category=UserWarning)
+
     log.info(f"Device      : {device}")
     log.info(f"Model       : {args.model_name}")
     log.info(f"FP16        : {use_fp16}")
@@ -574,7 +609,10 @@ def main():
     log.info(f"Librosa     : {'yes' if HAS_LIBROSA else 'no'}")
 
     hf_kwargs = {"token": args.hf_token} if args.hf_token else {}
-    processor = AutoProcessor.from_pretrained(args.model_name, **hf_kwargs)
+    # WavLM là pure SSL model, không có tokenizer.
+    # AutoProcessor cố load Wav2Vec2CTCTokenizer → OSError.
+    # AutoFeatureExtractor chỉ load feature extractor (padding, normalising) → đúng.
+    processor = AutoFeatureExtractor.from_pretrained(args.model_name, **hf_kwargs)
     model     = WavLMModel.from_pretrained(args.model_name, **hf_kwargs).to(device)
     model.eval()
 

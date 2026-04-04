@@ -1,0 +1,528 @@
+(.venv) PS C:\Users\Administrator\Desktop\thgnn> python train_cv.py --aug-sds --n-folds 5
+Device : cuda
+Folds  : 5
+SDS    : True
+Seed   : 42
+
+Loading train + dev participants (combined for CV) ...
+Loaded 142 participants (0 skipped)
+  Positive: 42  Negative: 100
+
+Class distribution: [100, 42]
+  (29.6% positive)
+
+Fold 1: train=113 (pos=33, neg=80) | val=29 (pos=9, neg=20)
+
+============================================================
+  FOLD 1  |  train=113  val=29
+============================================================
+  After SDS: train=339  val=29
+  Params: 1,534,972
+  [Fold 1 Ep 001] tr_loss=0.2590 tr_auc=0.4949 | val_auc=0.3667 val_f1=0.4351 thr=0.62 | 2.5s
+  *** New best AUC=0.3667 F1=0.4351 → saved
+  [Fold 1 Ep 002] tr_loss=0.2023 tr_auc=0.5150 | val_auc=0.4333 val_f1=0.4912 thr=0.64 | 2.1s
+  *** New best AUC=0.4333 F1=0.4912 → saved
+C:\Users\Administrator\Desktop\thgnn\.venv\lib\site-packages\torch\optim\lr_scheduler.py:232: UserWarning: The epoch parameter in `scheduler.step()` was not necessary and is being deprecated where possible. Please use `scheduler.step()` to step the scheduler. During the deprecation, if epoch is different from None, the closed form is used instead of the new chainable 
+form, where available. Please open an issue if you are unable to replicate your use case: https://github.com/pytorch/pytorch/issues/new/choose.
+  warnings.warn(EPOCH_DEPRECATION_WARNING, UserWarning)
+  [Fold 1 Ep 003] tr_loss=0.2079 tr_auc=0.4897 | val_auc=0.5222 val_f1=0.5606 thr=0.60 | 2.1s
+  *** New best AUC=0.5222 F1=0.5606 → saved
+  [Fold 1 Ep 004] tr_loss=0.1605 tr_auc=0.5459 | val_auc=0.5611 val_f1=0.6037 thr=0.56 | 2.1s
+  *** New best AUC=0.5611 F1=0.6037 → saved
+  [Fold 1 Ep 005] tr_loss=0.1483 tr_auc=0.5411 | val_auc=0.5444 val_f1=0.5538 thr=0.58 | 2.1s
+  [Fold 1 Ep 006] tr_loss=0.1368 tr_auc=0.5298 | val_auc=0.6000 val_f1=0.6548 thr=0.58 | 2.1s
+  *** New best AUC=0.6000 F1=0.6548 → saved
+  [Fold 1 Ep 007] tr_loss=0.1231 tr_auc=0.5247 | val_auc=0.6444 val_f1=0.5317 thr=0.56 | 2.1s
+  *** New best AUC=0.6444 F1=0.5317 → saved
+  [Fold 1 Ep 008] tr_loss=0.1212 tr_auc=0.5154 | val_auc=0.6722 val_f1=0.5797 thr=0.56 | 2.1s
+  *** New best AUC=0.6722 F1=0.5797 → saved
+  [Fold 1 Ep 009] tr_loss=0.1166 tr_auc=0.4926 | val_auc=0.4333 val_f1=0.5167 thr=0.58 | 2.1s
+  [Fold 1 Ep 010] tr_loss=0.1184 tr_auc=0.4810 | val_auc=0.6222 val_f1=0.5054 thr=0.54 | 2.1s
+  [Fold 1 Ep 011] tr_loss=0.1017 tr_auc=0.5435 | val_auc=0.6556 val_f1=0.5735 thr=0.54 | 2.1s
+  [Fold 1 Ep 012] tr_loss=0.1054 tr_auc=0.5344 | val_auc=0.5556 val_f1=0.6530 thr=0.56 | 2.1s
+  [Fold 1 Ep 013] tr_loss=0.1033 tr_auc=0.5015 | val_auc=0.6167 val_f1=0.5797 thr=0.56 | 2.1s
+  [Fold 1 Ep 014] tr_loss=0.1004 tr_auc=0.5063 | val_auc=0.6222 val_f1=0.5606 thr=0.54 | 2.1s
+  [Fold 1 Ep 015] tr_loss=0.0922 tr_auc=0.5163 | val_auc=0.6556 val_f1=0.5972 thr=0.52 | 2.1s
+  [Fold 1 Ep 016] tr_loss=0.0914 tr_auc=0.5592 | val_auc=0.6722 val_f1=0.5430 thr=0.54 | 2.1s
+  [Fold 1 Ep 017] tr_loss=0.0963 tr_auc=0.5179 | val_auc=0.6000 val_f1=0.5292 thr=0.54 | 2.1s
+  [Fold 1 Ep 018] tr_loss=0.0930 tr_auc=0.5013 | val_auc=0.5500 val_f1=0.5430 thr=0.54 | 2.1s
+  [Fold 1 Ep 019] tr_loss=0.0882 tr_auc=0.5520 | val_auc=0.5111 val_f1=0.5695 thr=0.56 | 2.1s
+  [Fold 1 Ep 020] tr_loss=0.0864 tr_auc=0.5492 | val_auc=0.5500 val_f1=0.5167 thr=0.54 | 2.1s
+  [Fold 1 Ep 021] tr_loss=0.0925 tr_auc=0.5024 | val_auc=0.5278 val_f1=0.5538 thr=0.56 | 2.0s
+  [Fold 1 Ep 022] tr_loss=0.0922 tr_auc=0.4949 | val_auc=0.5944 val_f1=0.5953 thr=0.54 | 2.0s
+  [Fold 1 Ep 023] tr_loss=0.0900 tr_auc=0.5480 | val_auc=0.5500 val_f1=0.6255 thr=0.54 | 2.1s
+  [Fold 1 Ep 024] tr_loss=0.0880 tr_auc=0.5411 | val_auc=0.5389 val_f1=0.5292 thr=0.56 | 2.0s
+  [Fold 1 Ep 025] tr_loss=0.0856 tr_auc=0.5485 | val_auc=0.5667 val_f1=0.5421 thr=0.52 | 2.1s
+  [Fold 1 Ep 026] tr_loss=0.0828 tr_auc=0.5645 | val_auc=0.5222 val_f1=0.5120 thr=0.52 | 2.0s
+  [Fold 1 Ep 027] tr_loss=0.0860 tr_auc=0.5251 | val_auc=0.5056 val_f1=0.5421 thr=0.52 | 2.1s
+  [Fold 1 Ep 028] tr_loss=0.0823 tr_auc=0.5815 | val_auc=0.5056 val_f1=0.5421 thr=0.54 | 2.1s
+  [Fold 1 Ep 029] tr_loss=0.0807 tr_auc=0.5654 | val_auc=0.5667 val_f1=0.5421 thr=0.54 | 2.1s
+  [Fold 1 Ep 030] tr_loss=0.0910 tr_auc=0.4884 | val_auc=0.5056 val_f1=0.4952 thr=0.54 | 2.0s
+  [Fold 1 Ep 031] tr_loss=0.0788 tr_auc=0.5868 | val_auc=0.5333 val_f1=0.5606 thr=0.52 | 2.0s
+  [Fold 1 Ep 032] tr_loss=0.0751 tr_auc=0.6122 | val_auc=0.5000 val_f1=0.4351 thr=0.54 | 2.1s
+  [Fold 1 Ep 033] tr_loss=0.0797 tr_auc=0.5621 | val_auc=0.4444 val_f1=0.4361 thr=0.54 | 2.1s
+  [Fold 1 Ep 034] tr_loss=0.0739 tr_auc=0.6250 | val_auc=0.4944 val_f1=0.5167 thr=0.56 | 2.1s
+  [Fold 1 Ep 035] tr_loss=0.0791 tr_auc=0.5714 | val_auc=0.4944 val_f1=0.4547 thr=0.54 | 2.2s
+  [Fold 1 Ep 036] tr_loss=0.0787 tr_auc=0.5700 | val_auc=0.5056 val_f1=0.4351 thr=0.54 | 2.1s
+  [Fold 1 Ep 037] tr_loss=0.0800 tr_auc=0.5678 | val_auc=0.5167 val_f1=0.5054 thr=0.54 | 2.2s
+  [Fold 1 Ep 038] tr_loss=0.0792 tr_auc=0.5889 | val_auc=0.5167 val_f1=0.4746 thr=0.54 | 2.1s
+  [Fold 1 Ep 039] tr_loss=0.0737 tr_auc=0.6161 | val_auc=0.4389 val_f1=0.4952 thr=0.56 | 2.2s
+  [Fold 1 Ep 040] tr_loss=0.0750 tr_auc=0.6174 | val_auc=0.4500 val_f1=0.4952 thr=0.56 | 2.1s
+  [Fold 1 Ep 041] tr_loss=0.0830 tr_auc=0.5609 | val_auc=0.4389 val_f1=0.4351 thr=0.54 | 2.0s
+  [Fold 1 Ep 042] tr_loss=0.0799 tr_auc=0.5715 | val_auc=0.4778 val_f1=0.4351 thr=0.56 | 2.0s
+  [Fold 1 Ep 043] tr_loss=0.0744 tr_auc=0.6122 | val_auc=0.4556 val_f1=0.4952 thr=0.56 | 2.0s
+  [Fold 1 Ep 044] tr_loss=0.0776 tr_auc=0.5996 | val_auc=0.4278 val_f1=0.4874 thr=0.52 | 2.0s
+  [Fold 1 Ep 045] tr_loss=0.0761 tr_auc=0.6032 | val_auc=0.4222 val_f1=0.4547 thr=0.56 | 2.1s
+  [Fold 1 Ep 046] tr_loss=0.0783 tr_auc=0.5904 | val_auc=0.4611 val_f1=0.4952 thr=0.56 | 2.1s
+  [Fold 1 Ep 047] tr_loss=0.0767 tr_auc=0.5947 | val_auc=0.4222 val_f1=0.4952 thr=0.56 | 2.1s
+  [Fold 1 Ep 048] tr_loss=0.0752 tr_auc=0.6156 | val_auc=0.4167 val_f1=0.4547 thr=0.56 | 2.0s
+  Early stopping at epoch 48 (no_improve=40)
+
+  Fold 1 done: best_AUC=0.6722  best_F1=0.5797  epoch=8
+
+Fold 2: train=113 (pos=33, neg=80) | val=29 (pos=9, neg=20)
+
+============================================================
+  FOLD 2  |  train=113  val=29
+============================================================
+  After SDS: train=339  val=29
+  Params: 1,534,972
+  [Fold 2 Ep 001] tr_loss=0.3207 tr_auc=0.3929 | val_auc=0.4500 val_f1=0.5292 thr=0.68 | 2.0s
+  *** New best AUC=0.4500 F1=0.5292 → saved
+  [Fold 2 Ep 002] tr_loss=0.2547 tr_auc=0.5144 | val_auc=0.4444 val_f1=0.5292 thr=0.54 | 2.2s
+C:\Users\Administrator\Desktop\thgnn\.venv\lib\site-packages\torch\optim\lr_scheduler.py:232: UserWarning: The epoch parameter in `scheduler.step()` was not necessary and is being deprecated where possible. Please use `scheduler.step()` to step the scheduler. During the deprecation, if epoch is different from None, the closed form is used instead of the new chainable 
+form, where available. Please open an issue if you are unable to replicate your use case: https://github.com/pytorch/pytorch/issues/new/choose.
+  warnings.warn(EPOCH_DEPRECATION_WARNING, UserWarning)
+  [Fold 2 Ep 003] tr_loss=0.2238 tr_auc=0.5068 | val_auc=0.4778 val_f1=0.5148 thr=0.60 | 2.0s
+  *** New best AUC=0.4778 F1=0.5148 → saved
+  [Fold 2 Ep 004] tr_loss=0.1785 tr_auc=0.5186 | val_auc=0.5056 val_f1=0.5735 thr=0.56 | 2.0s
+  *** New best AUC=0.5056 F1=0.5735 → saved
+  [Fold 2 Ep 005] tr_loss=0.1381 tr_auc=0.5487 | val_auc=0.5722 val_f1=0.6338 thr=0.56 | 2.1s
+  *** New best AUC=0.5722 F1=0.6338 → saved
+  [Fold 2 Ep 006] tr_loss=0.1502 tr_auc=0.5058 | val_auc=0.6111 val_f1=0.5735 thr=0.54 | 2.0s
+  *** New best AUC=0.6111 F1=0.5735 → saved
+  [Fold 2 Ep 007] tr_loss=0.1358 tr_auc=0.5094 | val_auc=0.6111 val_f1=0.6037 thr=0.56 | 2.1s
+  *** New best AUC=0.6111 F1=0.6037 → saved
+  [Fold 2 Ep 008] tr_loss=0.1097 tr_auc=0.6068 | val_auc=0.5056 val_f1=0.5817 thr=0.58 | 2.0s
+  [Fold 2 Ep 009] tr_loss=0.1351 tr_auc=0.5199 | val_auc=0.5389 val_f1=0.5606 thr=0.56 | 2.1s
+  [Fold 2 Ep 010] tr_loss=0.1197 tr_auc=0.5217 | val_auc=0.5444 val_f1=0.4874 thr=0.52 | 2.2s
+  [Fold 2 Ep 011] tr_loss=0.1230 tr_auc=0.4543 | val_auc=0.5500 val_f1=0.5817 thr=0.52 | 2.1s
+  [Fold 2 Ep 012] tr_loss=0.0965 tr_auc=0.5850 | val_auc=0.5278 val_f1=0.5167 thr=0.52 | 2.0s
+  [Fold 2 Ep 013] tr_loss=0.1107 tr_auc=0.5110 | val_auc=0.5389 val_f1=0.5167 thr=0.50 | 2.0s
+  [Fold 2 Ep 014] tr_loss=0.1113 tr_auc=0.5029 | val_auc=0.5556 val_f1=0.6133 thr=0.54 | 2.0s
+  [Fold 2 Ep 015] tr_loss=0.0994 tr_auc=0.5354 | val_auc=0.5222 val_f1=0.4828 thr=0.52 | 2.1s
+  [Fold 2 Ep 016] tr_loss=0.0985 tr_auc=0.5285 | val_auc=0.5500 val_f1=0.5167 thr=0.54 | 2.0s
+  [Fold 2 Ep 017] tr_loss=0.0916 tr_auc=0.5512 | val_auc=0.5944 val_f1=0.5894 thr=0.52 | 2.1s
+  [Fold 2 Ep 018] tr_loss=0.0964 tr_auc=0.4703 | val_auc=0.5833 val_f1=0.5148 thr=0.52 | 2.1s
+  [Fold 2 Ep 019] tr_loss=0.0817 tr_auc=0.5966 | val_auc=0.6000 val_f1=0.5606 thr=0.52 | 2.2s
+  [Fold 2 Ep 020] tr_loss=0.0886 tr_auc=0.5469 | val_auc=0.6167 val_f1=0.5167 thr=0.54 | 2.2s
+  *** New best AUC=0.6167 F1=0.5167 → saved
+  [Fold 2 Ep 021] tr_loss=0.0895 tr_auc=0.5622 | val_auc=0.6500 val_f1=0.6184 thr=0.54 | 2.1s
+  *** New best AUC=0.6500 F1=0.6184 → saved
+  [Fold 2 Ep 022] tr_loss=0.0906 tr_auc=0.5170 | val_auc=0.6389 val_f1=0.5606 thr=0.54 | 2.2s
+  [Fold 2 Ep 023] tr_loss=0.0906 tr_auc=0.5241 | val_auc=0.5944 val_f1=0.6133 thr=0.52 | 2.2s
+  [Fold 2 Ep 024] tr_loss=0.0813 tr_auc=0.5629 | val_auc=0.6056 val_f1=0.5496 thr=0.52 | 2.1s
+  [Fold 2 Ep 025] tr_loss=0.0852 tr_auc=0.5545 | val_auc=0.5667 val_f1=0.5167 thr=0.56 | 2.3s
+  [Fold 2 Ep 026] tr_loss=0.0900 tr_auc=0.5107 | val_auc=0.5833 val_f1=0.5167 thr=0.52 | 2.1s
+  [Fold 2 Ep 027] tr_loss=0.0820 tr_auc=0.5718 | val_auc=0.5611 val_f1=0.5167 thr=0.54 | 2.2s
+  [Fold 2 Ep 028] tr_loss=0.0859 tr_auc=0.5657 | val_auc=0.6222 val_f1=0.5430 thr=0.54 | 2.1s
+  [Fold 2 Ep 029] tr_loss=0.0884 tr_auc=0.5089 | val_auc=0.6333 val_f1=0.5167 thr=0.58 | 2.1s
+  [Fold 2 Ep 030] tr_loss=0.0805 tr_auc=0.5862 | val_auc=0.6056 val_f1=0.5167 thr=0.52 | 2.1s
+  [Fold 2 Ep 031] tr_loss=0.0859 tr_auc=0.5393 | val_auc=0.6167 val_f1=0.5148 thr=0.52 | 2.1s
+  [Fold 2 Ep 032] tr_loss=0.0810 tr_auc=0.5771 | val_auc=0.6444 val_f1=0.5167 thr=0.52 | 2.1s
+  [Fold 2 Ep 033] tr_loss=0.0782 tr_auc=0.6035 | val_auc=0.6333 val_f1=0.5423 thr=0.54 | 2.0s
+  [Fold 2 Ep 034] tr_loss=0.0821 tr_auc=0.5659 | val_auc=0.6056 val_f1=0.5421 thr=0.54 | 2.0s
+  [Fold 2 Ep 035] tr_loss=0.0832 tr_auc=0.5502 | val_auc=0.5889 val_f1=0.5423 thr=0.56 | 2.1s
+  [Fold 2 Ep 036] tr_loss=0.0788 tr_auc=0.5851 | val_auc=0.6278 val_f1=0.5695 thr=0.54 | 2.0s
+  [Fold 2 Ep 037] tr_loss=0.0761 tr_auc=0.6347 | val_auc=0.6389 val_f1=0.5735 thr=0.50 | 2.0s
+  [Fold 2 Ep 038] tr_loss=0.0823 tr_auc=0.5698 | val_auc=0.6278 val_f1=0.6037 thr=0.52 | 2.1s
+  [Fold 2 Ep 039] tr_loss=0.0793 tr_auc=0.5692 | val_auc=0.6111 val_f1=0.5167 thr=0.60 | 2.1s
+  [Fold 2 Ep 040] tr_loss=0.0841 tr_auc=0.5167 | val_auc=0.6444 val_f1=0.5817 thr=0.52 | 2.1s
+  [Fold 2 Ep 041] tr_loss=0.0781 tr_auc=0.5862 | val_auc=0.6389 val_f1=0.5857 thr=0.50 | 2.1s
+  [Fold 2 Ep 042] tr_loss=0.0768 tr_auc=0.6327 | val_auc=0.6556 val_f1=0.5857 thr=0.50 | 2.0s
+  *** New best AUC=0.6556 F1=0.5857 → saved
+  [Fold 2 Ep 043] tr_loss=0.0778 tr_auc=0.6162 | val_auc=0.6667 val_f1=0.6037 thr=0.52 | 2.1s
+  *** New best AUC=0.6667 F1=0.6037 → saved
+  [Fold 2 Ep 044] tr_loss=0.0757 tr_auc=0.6135 | val_auc=0.6444 val_f1=0.6037 thr=0.54 | 2.1s
+  [Fold 2 Ep 045] tr_loss=0.0736 tr_auc=0.6479 | val_auc=0.6611 val_f1=0.6184 thr=0.54 | 2.0s
+  [Fold 2 Ep 046] tr_loss=0.0754 tr_auc=0.6239 | val_auc=0.6333 val_f1=0.6184 thr=0.52 | 2.2s
+  [Fold 2 Ep 047] tr_loss=0.0753 tr_auc=0.6549 | val_auc=0.6556 val_f1=0.6037 thr=0.52 | 2.1s
+  [Fold 2 Ep 048] tr_loss=0.0753 tr_auc=0.6021 | val_auc=0.6333 val_f1=0.5735 thr=0.50 | 2.1s
+  [Fold 2 Ep 049] tr_loss=0.0775 tr_auc=0.6169 | val_auc=0.6556 val_f1=0.5735 thr=0.50 | 2.0s
+  [Fold 2 Ep 050] tr_loss=0.0711 tr_auc=0.6413 | val_auc=0.6667 val_f1=0.6184 thr=0.52 | 2.0s
+  [Fold 2 Ep 051] tr_loss=0.0721 tr_auc=0.6509 | val_auc=0.6444 val_f1=0.5735 thr=0.48 | 2.0s
+  [Fold 2 Ep 052] tr_loss=0.0785 tr_auc=0.6173 | val_auc=0.6611 val_f1=0.6133 thr=0.48 | 2.1s
+  [Fold 2 Ep 053] tr_loss=0.0697 tr_auc=0.6968 | val_auc=0.6500 val_f1=0.5817 thr=0.48 | 2.1s
+  [Fold 2 Ep 054] tr_loss=0.0825 tr_auc=0.5584 | val_auc=0.6278 val_f1=0.5735 thr=0.52 | 2.1s
+  [Fold 2 Ep 055] tr_loss=0.0703 tr_auc=0.6745 | val_auc=0.6222 val_f1=0.5735 thr=0.50 | 2.1s
+  [Fold 2 Ep 056] tr_loss=0.0749 tr_auc=0.6303 | val_auc=0.6167 val_f1=0.5606 thr=0.50 | 2.0s
+  [Fold 2 Ep 057] tr_loss=0.0744 tr_auc=0.6220 | val_auc=0.6056 val_f1=0.5817 thr=0.44 | 2.1s
+  [Fold 2 Ep 058] tr_loss=0.0731 tr_auc=0.6431 | val_auc=0.6167 val_f1=0.5606 thr=0.48 | 2.0s
+  [Fold 2 Ep 059] tr_loss=0.0750 tr_auc=0.6512 | val_auc=0.6056 val_f1=0.5857 thr=0.46 | 2.0s
+  [Fold 2 Ep 060] tr_loss=0.0741 tr_auc=0.6450 | val_auc=0.6111 val_f1=0.5735 thr=0.50 | 2.0s
+  [Fold 2 Ep 061] tr_loss=0.0770 tr_auc=0.5994 | val_auc=0.6278 val_f1=0.5894 thr=0.52 | 2.1s
+  [Fold 2 Ep 062] tr_loss=0.0765 tr_auc=0.5990 | val_auc=0.6389 val_f1=0.5857 thr=0.48 | 2.1s
+  [Fold 2 Ep 063] tr_loss=0.0707 tr_auc=0.6511 | val_auc=0.6444 val_f1=0.5735 thr=0.50 | 2.1s
+  [Fold 2 Ep 064] tr_loss=0.0669 tr_auc=0.7322 | val_auc=0.6333 val_f1=0.5735 thr=0.48 | 2.1s
+  [Fold 2 Ep 065] tr_loss=0.0656 tr_auc=0.7106 | val_auc=0.6278 val_f1=0.5857 thr=0.44 | 2.0s
+  [Fold 2 Ep 066] tr_loss=0.0702 tr_auc=0.6746 | val_auc=0.6111 val_f1=0.5817 thr=0.44 | 2.0s
+  [Fold 2 Ep 067] tr_loss=0.0673 tr_auc=0.7006 | val_auc=0.6278 val_f1=0.5817 thr=0.46 | 2.0s
+  [Fold 2 Ep 068] tr_loss=0.0706 tr_auc=0.7008 | val_auc=0.6278 val_f1=0.5857 thr=0.46 | 2.0s
+  [Fold 2 Ep 069] tr_loss=0.0718 tr_auc=0.6932 | val_auc=0.6167 val_f1=0.6189 thr=0.42 | 2.0s
+  [Fold 2 Ep 070] tr_loss=0.0652 tr_auc=0.7387 | val_auc=0.6278 val_f1=0.6189 thr=0.44 | 2.0s
+  [Fold 2 Ep 071] tr_loss=0.0674 tr_auc=0.6899 | val_auc=0.6222 val_f1=0.5695 thr=0.54 | 2.0s
+  [Fold 2 Ep 072] tr_loss=0.0684 tr_auc=0.7101 | val_auc=0.6167 val_f1=0.5735 thr=0.44 | 2.1s
+  [Fold 2 Ep 073] tr_loss=0.0725 tr_auc=0.6762 | val_auc=0.6278 val_f1=0.5972 thr=0.54 | 2.0s
+  [Fold 2 Ep 074] tr_loss=0.0620 tr_auc=0.7698 | val_auc=0.6222 val_f1=0.5817 thr=0.42 | 2.1s
+  [Fold 2 Ep 075] tr_loss=0.0630 tr_auc=0.7586 | val_auc=0.6056 val_f1=0.5817 thr=0.40 | 2.0s
+  [Fold 2 Ep 076] tr_loss=0.0690 tr_auc=0.7021 | val_auc=0.6056 val_f1=0.5817 thr=0.42 | 2.0s
+  [Fold 2 Ep 077] tr_loss=0.0634 tr_auc=0.7536 | val_auc=0.6000 val_f1=0.5606 thr=0.46 | 2.0s
+  [Fold 2 Ep 078] tr_loss=0.0687 tr_auc=0.7269 | val_auc=0.6056 val_f1=0.5857 thr=0.40 | 2.2s
+  [Fold 2 Ep 079] tr_loss=0.0695 tr_auc=0.7027 | val_auc=0.6111 val_f1=0.5735 thr=0.42 | 2.1s
+  [Fold 2 Ep 080] tr_loss=0.0641 tr_auc=0.7367 | val_auc=0.5833 val_f1=0.5606 thr=0.42 | 2.0s
+  [Fold 2 Ep 081] tr_loss=0.0623 tr_auc=0.7605 | val_auc=0.6056 val_f1=0.5817 thr=0.40 | 2.0s
+  [Fold 2 Ep 082] tr_loss=0.0686 tr_auc=0.7023 | val_auc=0.6111 val_f1=0.5695 thr=0.56 | 2.0s
+  [Fold 2 Ep 083] tr_loss=0.0657 tr_auc=0.7141 | val_auc=0.6167 val_f1=0.6133 thr=0.44 | 2.0s
+  Early stopping at epoch 83 (no_improve=40)
+
+  Fold 2 done: best_AUC=0.6667  best_F1=0.6037  epoch=43
+
+Fold 3: train=114 (pos=34, neg=80) | val=28 (pos=8, neg=20)
+
+============================================================
+  FOLD 3  |  train=114  val=28
+============================================================
+  After SDS: train=342  val=28
+  Params: 1,534,972
+  [Fold 3 Ep 001] tr_loss=0.2868 tr_auc=0.5184 | val_auc=0.7500 val_f1=0.7375 thr=0.60 | 2.0s
+  *** New best AUC=0.7500 F1=0.7375 → saved
+  [Fold 3 Ep 002] tr_loss=0.2563 tr_auc=0.5212 | val_auc=0.7875 val_f1=0.7143 thr=0.64 | 2.1s
+  *** New best AUC=0.7875 F1=0.7143 → saved
+C:\Users\Administrator\Desktop\thgnn\.venv\lib\site-packages\torch\optim\lr_scheduler.py:232: UserWarning: The epoch parameter in `scheduler.step()` was not necessary and is being deprecated where possible. Please use `scheduler.step()` to step the scheduler. During the deprecation, if epoch is different from None, the closed form is used instead of the new chainable 
+form, where available. Please open an issue if you are unable to replicate your use case: https://github.com/pytorch/pytorch/issues/new/choose.
+  warnings.warn(EPOCH_DEPRECATION_WARNING, UserWarning)
+  [Fold 3 Ep 003] tr_loss=0.2372 tr_auc=0.5007 | val_auc=0.7625 val_f1=0.7496 thr=0.70 | 2.0s
+  [Fold 3 Ep 004] tr_loss=0.2043 tr_auc=0.4977 | val_auc=0.8250 val_f1=0.8095 thr=0.62 | 2.1s
+  *** New best AUC=0.8250 F1=0.8095 → saved
+  [Fold 3 Ep 005] tr_loss=0.1774 tr_auc=0.4903 | val_auc=0.8250 val_f1=0.7879 thr=0.62 | 2.1s
+  [Fold 3 Ep 006] tr_loss=0.1479 tr_auc=0.5393 | val_auc=0.7688 val_f1=0.7544 thr=0.60 | 2.1s
+  [Fold 3 Ep 007] tr_loss=0.1281 tr_auc=0.5191 | val_auc=0.7063 val_f1=0.7496 thr=0.56 | 2.2s
+  [Fold 3 Ep 008] tr_loss=0.1330 tr_auc=0.5034 | val_auc=0.6625 val_f1=0.7172 thr=0.60 | 2.0s
+  [Fold 3 Ep 009] tr_loss=0.1268 tr_auc=0.5202 | val_auc=0.7750 val_f1=0.6199 thr=0.54 | 2.0s
+  [Fold 3 Ep 010] tr_loss=0.1187 tr_auc=0.5001 | val_auc=0.7562 val_f1=0.7879 thr=0.58 | 2.1s
+  [Fold 3 Ep 011] tr_loss=0.1162 tr_auc=0.5289 | val_auc=0.6938 val_f1=0.7172 thr=0.58 | 2.0s
+  [Fold 3 Ep 012] tr_loss=0.1151 tr_auc=0.4483 | val_auc=0.7062 val_f1=0.6818 thr=0.58 | 2.1s
+  [Fold 3 Ep 013] tr_loss=0.0936 tr_auc=0.5245 | val_auc=0.7063 val_f1=0.6818 thr=0.58 | 2.0s
+  [Fold 3 Ep 014] tr_loss=0.0984 tr_auc=0.5189 | val_auc=0.7562 val_f1=0.6494 thr=0.58 | 2.1s
+  [Fold 3 Ep 015] tr_loss=0.0991 tr_auc=0.5242 | val_auc=0.7375 val_f1=0.7044 thr=0.56 | 2.1s
+  [Fold 3 Ep 016] tr_loss=0.0891 tr_auc=0.5462 | val_auc=0.7625 val_f1=0.6348 thr=0.58 | 2.0s
+  [Fold 3 Ep 017] tr_loss=0.0951 tr_auc=0.5131 | val_auc=0.7312 val_f1=0.7172 thr=0.56 | 2.1s
+  [Fold 3 Ep 018] tr_loss=0.0973 tr_auc=0.4972 | val_auc=0.7375 val_f1=0.5942 thr=0.52 | 2.0s
+  [Fold 3 Ep 019] tr_loss=0.0985 tr_auc=0.4859 | val_auc=0.6250 val_f1=0.5625 thr=0.54 | 2.0s
+  [Fold 3 Ep 020] tr_loss=0.0915 tr_auc=0.5057 | val_auc=0.7125 val_f1=0.6348 thr=0.56 | 2.1s
+  [Fold 3 Ep 021] tr_loss=0.0881 tr_auc=0.5299 | val_auc=0.6625 val_f1=0.5906 thr=0.54 | 2.0s
+  [Fold 3 Ep 022] tr_loss=0.0851 tr_auc=0.5486 | val_auc=0.7000 val_f1=0.6040 thr=0.54 | 2.1s
+  [Fold 3 Ep 023] tr_loss=0.0821 tr_auc=0.5796 | val_auc=0.6750 val_f1=0.6257 thr=0.54 | 2.1s
+  [Fold 3 Ep 024] tr_loss=0.0829 tr_auc=0.5701 | val_auc=0.7063 val_f1=0.5366 thr=0.56 | 2.1s
+  [Fold 3 Ep 025] tr_loss=0.0834 tr_auc=0.5269 | val_auc=0.7063 val_f1=0.5130 thr=0.56 | 2.0s
+  [Fold 3 Ep 026] tr_loss=0.0857 tr_auc=0.5385 | val_auc=0.7438 val_f1=0.6040 thr=0.56 | 2.0s
+  [Fold 3 Ep 027] tr_loss=0.0835 tr_auc=0.5352 | val_auc=0.8000 val_f1=0.7496 thr=0.56 | 2.1s
+  [Fold 3 Ep 028] tr_loss=0.0857 tr_auc=0.5212 | val_auc=0.7688 val_f1=0.7172 thr=0.56 | 2.0s
+  [Fold 3 Ep 029] tr_loss=0.0799 tr_auc=0.5684 | val_auc=0.6813 val_f1=0.6348 thr=0.56 | 2.0s
+  [Fold 3 Ep 030] tr_loss=0.0819 tr_auc=0.5462 | val_auc=0.7000 val_f1=0.6199 thr=0.54 | 2.0s
+  [Fold 3 Ep 031] tr_loss=0.0804 tr_auc=0.5675 | val_auc=0.6875 val_f1=0.5130 thr=0.54 | 2.1s
+  [Fold 3 Ep 032] tr_loss=0.0829 tr_auc=0.5240 | val_auc=0.6625 val_f1=0.6494 thr=0.54 | 2.0s
+  [Fold 3 Ep 033] tr_loss=0.0791 tr_auc=0.5599 | val_auc=0.7625 val_f1=0.6571 thr=0.54 | 2.0s
+  [Fold 3 Ep 034] tr_loss=0.0837 tr_auc=0.5325 | val_auc=0.7875 val_f1=0.6500 thr=0.54 | 2.0s
+  [Fold 3 Ep 035] tr_loss=0.0777 tr_auc=0.5898 | val_auc=0.7875 val_f1=0.7172 thr=0.56 | 2.0s
+  [Fold 3 Ep 036] tr_loss=0.0833 tr_auc=0.5169 | val_auc=0.7188 val_f1=0.6415 thr=0.54 | 2.0s
+  [Fold 3 Ep 037] tr_loss=0.0772 tr_auc=0.5878 | val_auc=0.7313 val_f1=0.6818 thr=0.56 | 2.0s
+  [Fold 3 Ep 038] tr_loss=0.0816 tr_auc=0.5274 | val_auc=0.6625 val_f1=0.7172 thr=0.56 | 2.0s
+  [Fold 3 Ep 039] tr_loss=0.0808 tr_auc=0.5522 | val_auc=0.6937 val_f1=0.6500 thr=0.54 | 2.0s
+  [Fold 3 Ep 040] tr_loss=0.0796 tr_auc=0.5385 | val_auc=0.6562 val_f1=0.6348 thr=0.56 | 2.1s
+  [Fold 3 Ep 041] tr_loss=0.0830 tr_auc=0.5010 | val_auc=0.6188 val_f1=0.7496 thr=0.54 | 2.2s
+  [Fold 3 Ep 042] tr_loss=0.0799 tr_auc=0.5467 | val_auc=0.6687 val_f1=0.7496 thr=0.54 | 2.1s
+  [Fold 3 Ep 043] tr_loss=0.0778 tr_auc=0.5924 | val_auc=0.7063 val_f1=0.6813 thr=0.54 | 2.0s
+  [Fold 3 Ep 044] tr_loss=0.0800 tr_auc=0.5412 | val_auc=0.6938 val_f1=0.7143 thr=0.54 | 2.0s
+  Early stopping at epoch 44 (no_improve=40)
+
+  Fold 3 done: best_AUC=0.8250  best_F1=0.8095  epoch=4
+
+Fold 4: train=114 (pos=34, neg=80) | val=28 (pos=8, neg=20)
+
+============================================================
+  FOLD 4  |  train=114  val=28
+============================================================
+  After SDS: train=342  val=28
+  Params: 1,534,972
+  [Fold 4 Ep 001] tr_loss=0.3530 tr_auc=0.5028 | val_auc=0.6500 val_f1=0.7212 thr=0.58 | 2.1s
+  *** New best AUC=0.6500 F1=0.7212 → saved
+  [Fold 4 Ep 002] tr_loss=0.2454 tr_auc=0.5064 | val_auc=0.6062 val_f1=0.6494 thr=0.74 | 2.2s
+C:\Users\Administrator\Desktop\thgnn\.venv\lib\site-packages\torch\optim\lr_scheduler.py:232: UserWarning: The epoch parameter in `scheduler.step()` was not necessary and is being deprecated where possible. Please use `scheduler.step()` to step the scheduler. During the deprecation, if epoch is different from None, the closed form is used instead of the new chainable 
+form, where available. Please open an issue if you are unable to replicate your use case: https://github.com/pytorch/pytorch/issues/new/choose.
+  warnings.warn(EPOCH_DEPRECATION_WARNING, UserWarning)
+  [Fold 4 Ep 003] tr_loss=0.2116 tr_auc=0.5402 | val_auc=0.6312 val_f1=0.5810 thr=0.62 | 2.1s
+  [Fold 4 Ep 004] tr_loss=0.1934 tr_auc=0.4870 | val_auc=0.6812 val_f1=0.6199 thr=0.68 | 2.1s
+  *** New best AUC=0.6812 F1=0.6199 → saved
+  [Fold 4 Ep 005] tr_loss=0.1501 tr_auc=0.5741 | val_auc=0.6187 val_f1=0.6500 thr=0.68 | 2.1s
+  [Fold 4 Ep 006] tr_loss=0.1413 tr_auc=0.5416 | val_auc=0.6875 val_f1=0.6026 thr=0.58 | 2.1s
+  *** New best AUC=0.6875 F1=0.6026 → saved
+  [Fold 4 Ep 007] tr_loss=0.1345 tr_auc=0.5215 | val_auc=0.6188 val_f1=0.6111 thr=0.62 | 2.1s
+  [Fold 4 Ep 008] tr_loss=0.1233 tr_auc=0.5312 | val_auc=0.6875 val_f1=0.6257 thr=0.58 | 2.2s
+  [Fold 4 Ep 009] tr_loss=0.1080 tr_auc=0.5654 | val_auc=0.7188 val_f1=0.6571 thr=0.58 | 2.1s
+  *** New best AUC=0.7188 F1=0.6571 → saved
+  [Fold 4 Ep 010] tr_loss=0.1181 tr_auc=0.5483 | val_auc=0.6562 val_f1=0.7005 thr=0.62 | 2.1s
+  [Fold 4 Ep 011] tr_loss=0.1135 tr_auc=0.5299 | val_auc=0.6375 val_f1=0.6354 thr=0.60 | 2.2s
+  [Fold 4 Ep 012] tr_loss=0.1039 tr_auc=0.5502 | val_auc=0.7063 val_f1=0.6725 thr=0.60 | 2.0s
+  [Fold 4 Ep 013] tr_loss=0.1037 tr_auc=0.5308 | val_auc=0.6125 val_f1=0.5625 thr=0.54 | 2.1s
+  [Fold 4 Ep 014] tr_loss=0.1076 tr_auc=0.5283 | val_auc=0.6250 val_f1=0.6348 thr=0.58 | 2.0s
+  [Fold 4 Ep 015] tr_loss=0.1111 tr_auc=0.5035 | val_auc=0.6438 val_f1=0.6111 thr=0.58 | 2.1s
+  [Fold 4 Ep 016] tr_loss=0.1066 tr_auc=0.4936 | val_auc=0.6313 val_f1=0.5619 thr=0.56 | 2.1s
+  [Fold 4 Ep 017] tr_loss=0.0912 tr_auc=0.5605 | val_auc=0.6437 val_f1=0.6257 thr=0.56 | 2.2s
+  [Fold 4 Ep 018] tr_loss=0.0985 tr_auc=0.4991 | val_auc=0.6062 val_f1=0.5366 thr=0.58 | 2.1s
+  [Fold 4 Ep 019] tr_loss=0.0935 tr_auc=0.5474 | val_auc=0.6500 val_f1=0.5508 thr=0.56 | 2.2s
+  [Fold 4 Ep 020] tr_loss=0.0880 tr_auc=0.5503 | val_auc=0.6438 val_f1=0.5902 thr=0.56 | 2.1s
+  [Fold 4 Ep 021] tr_loss=0.0901 tr_auc=0.5400 | val_auc=0.6938 val_f1=0.6494 thr=0.58 | 2.0s
+  [Fold 4 Ep 022] tr_loss=0.0774 tr_auc=0.6203 | val_auc=0.6938 val_f1=0.6190 thr=0.58 | 2.1s
+  [Fold 4 Ep 023] tr_loss=0.0858 tr_auc=0.5656 | val_auc=0.6937 val_f1=0.6199 thr=0.56 | 2.2s
+  [Fold 4 Ep 024] tr_loss=0.0882 tr_auc=0.5246 | val_auc=0.7000 val_f1=0.6494 thr=0.58 | 2.1s
+  [Fold 4 Ep 025] tr_loss=0.0832 tr_auc=0.5886 | val_auc=0.6875 val_f1=0.6818 thr=0.58 | 2.0s
+  [Fold 4 Ep 026] tr_loss=0.0777 tr_auc=0.6021 | val_auc=0.7000 val_f1=0.5902 thr=0.56 | 2.0s
+  [Fold 4 Ep 027] tr_loss=0.0898 tr_auc=0.5181 | val_auc=0.7000 val_f1=0.6494 thr=0.56 | 2.0s
+  [Fold 4 Ep 028] tr_loss=0.0814 tr_auc=0.5724 | val_auc=0.6750 val_f1=0.6415 thr=0.56 | 2.0s
+  [Fold 4 Ep 029] tr_loss=0.0795 tr_auc=0.5861 | val_auc=0.7000 val_f1=0.6348 thr=0.58 | 2.0s
+  [Fold 4 Ep 030] tr_loss=0.0856 tr_auc=0.5391 | val_auc=0.6937 val_f1=0.6111 thr=0.56 | 2.0s
+  [Fold 4 Ep 031] tr_loss=0.0816 tr_auc=0.5728 | val_auc=0.6938 val_f1=0.6494 thr=0.56 | 2.1s
+  [Fold 4 Ep 032] tr_loss=0.0785 tr_auc=0.6086 | val_auc=0.6875 val_f1=0.6494 thr=0.56 | 2.0s
+  [Fold 4 Ep 033] tr_loss=0.0748 tr_auc=0.6250 | val_auc=0.6625 val_f1=0.6190 thr=0.56 | 2.0s
+  [Fold 4 Ep 034] tr_loss=0.0779 tr_auc=0.6186 | val_auc=0.6438 val_f1=0.6818 thr=0.56 | 2.1s
+  [Fold 4 Ep 035] tr_loss=0.0739 tr_auc=0.6480 | val_auc=0.6500 val_f1=0.6494 thr=0.56 | 2.2s
+  [Fold 4 Ep 036] tr_loss=0.0761 tr_auc=0.6134 | val_auc=0.6750 val_f1=0.6818 thr=0.60 | 2.1s
+  [Fold 4 Ep 037] tr_loss=0.0753 tr_auc=0.6342 | val_auc=0.6687 val_f1=0.6818 thr=0.58 | 2.0s
+  [Fold 4 Ep 038] tr_loss=0.0788 tr_auc=0.6261 | val_auc=0.6562 val_f1=0.6494 thr=0.58 | 2.0s
+  [Fold 4 Ep 039] tr_loss=0.0763 tr_auc=0.6109 | val_auc=0.6625 val_f1=0.6348 thr=0.58 | 2.0s
+  [Fold 4 Ep 040] tr_loss=0.0754 tr_auc=0.6424 | val_auc=0.6687 val_f1=0.6348 thr=0.58 | 2.0s
+  [Fold 4 Ep 041] tr_loss=0.0875 tr_auc=0.5467 | val_auc=0.6750 val_f1=0.6494 thr=0.60 | 2.0s
+  [Fold 4 Ep 042] tr_loss=0.0715 tr_auc=0.6673 | val_auc=0.6812 val_f1=0.7172 thr=0.60 | 2.1s
+  [Fold 4 Ep 043] tr_loss=0.0727 tr_auc=0.6418 | val_auc=0.6625 val_f1=0.7172 thr=0.62 | 2.1s
+  [Fold 4 Ep 044] tr_loss=0.0749 tr_auc=0.6573 | val_auc=0.6500 val_f1=0.7172 thr=0.58 | 2.0s
+  [Fold 4 Ep 045] tr_loss=0.0750 tr_auc=0.6455 | val_auc=0.6438 val_f1=0.6348 thr=0.58 | 2.1s
+  [Fold 4 Ep 046] tr_loss=0.0729 tr_auc=0.6459 | val_auc=0.6562 val_f1=0.6494 thr=0.60 | 2.1s
+  [Fold 4 Ep 047] tr_loss=0.0694 tr_auc=0.6789 | val_auc=0.6375 val_f1=0.6494 thr=0.58 | 2.0s
+  [Fold 4 Ep 048] tr_loss=0.0717 tr_auc=0.6551 | val_auc=0.6437 val_f1=0.6818 thr=0.60 | 2.0s
+  [Fold 4 Ep 049] tr_loss=0.0734 tr_auc=0.6434 | val_auc=0.6313 val_f1=0.6818 thr=0.58 | 2.0s
+  Early stopping at epoch 49 (no_improve=40)
+
+  Fold 4 done: best_AUC=0.7188  best_F1=0.6571  epoch=9
+
+Fold 5: train=114 (pos=34, neg=80) | val=28 (pos=8, neg=20)
+
+============================================================
+  FOLD 5  |  train=114  val=28
+============================================================
+  After SDS: train=342  val=28
+  Params: 1,534,972
+  [Fold 5 Ep 001] tr_loss=0.3373 tr_auc=0.4841 | val_auc=0.4500 val_f1=0.4992 thr=0.62 | 2.1s
+  *** New best AUC=0.4500 F1=0.4992 → saved
+  [Fold 5 Ep 002] tr_loss=0.2661 tr_auc=0.4489 | val_auc=0.5875 val_f1=0.6199 thr=0.72 | 2.2s
+  *** New best AUC=0.5875 F1=0.6199 → saved
+C:\Users\Administrator\Desktop\thgnn\.venv\lib\site-packages\torch\optim\lr_scheduler.py:232: UserWarning: The epoch parameter in `scheduler.step()` was not necessary and is being deprecated where possible. Please use `scheduler.step()` to step the scheduler. During the deprecation, if epoch is different from None, the closed form is used instead of the new chainable 
+form, where available. Please open an issue if you are unable to replicate your use case: https://github.com/pytorch/pytorch/issues/new/choose.
+  warnings.warn(EPOCH_DEPRECATION_WARNING, UserWarning)
+  [Fold 5 Ep 003] tr_loss=0.2090 tr_auc=0.4778 | val_auc=0.6062 val_f1=0.5942 thr=0.62 | 2.1s
+  *** New best AUC=0.6062 F1=0.5942 → saved
+  [Fold 5 Ep 004] tr_loss=0.1685 tr_auc=0.5204 | val_auc=0.6062 val_f1=0.4256 thr=0.64 | 2.0s
+  [Fold 5 Ep 005] tr_loss=0.1859 tr_auc=0.5151 | val_auc=0.4812 val_f1=0.5333 thr=0.62 | 2.1s
+  [Fold 5 Ep 006] tr_loss=0.1555 tr_auc=0.5227 | val_auc=0.5375 val_f1=0.5048 thr=0.58 | 2.0s
+  [Fold 5 Ep 007] tr_loss=0.1446 tr_auc=0.4911 | val_auc=0.5000 val_f1=0.5351 thr=0.58 | 2.0s
+  [Fold 5 Ep 008] tr_loss=0.1336 tr_auc=0.5068 | val_auc=0.4938 val_f1=0.5000 thr=0.56 | 2.3s
+  [Fold 5 Ep 009] tr_loss=0.1265 tr_auc=0.5149 | val_auc=0.5687 val_f1=0.4256 thr=0.60 | 2.4s
+  [Fold 5 Ep 010] tr_loss=0.1175 tr_auc=0.5132 | val_auc=0.4875 val_f1=0.4556 thr=0.62 | 2.1s
+  [Fold 5 Ep 011] tr_loss=0.1237 tr_auc=0.4886 | val_auc=0.4875 val_f1=0.4750 thr=0.58 | 2.0s
+  [Fold 5 Ep 012] tr_loss=0.1030 tr_auc=0.5377 | val_auc=0.6188 val_f1=0.5238 thr=0.60 | 2.0s
+  *** New best AUC=0.6188 F1=0.5238 → saved
+  [Fold 5 Ep 013] tr_loss=0.1095 tr_auc=0.5210 | val_auc=0.5875 val_f1=0.5204 thr=0.58 | 2.3s
+  [Fold 5 Ep 014] tr_loss=0.1090 tr_auc=0.5160 | val_auc=0.5000 val_f1=0.5238 thr=0.58 | 2.0s
+  [Fold 5 Ep 015] tr_loss=0.1043 tr_auc=0.4857 | val_auc=0.5813 val_f1=0.4992 thr=0.58 | 2.0s
+  [Fold 5 Ep 016] tr_loss=0.0967 tr_auc=0.5671 | val_auc=0.5563 val_f1=0.4992 thr=0.58 | 2.1s
+  [Fold 5 Ep 017] tr_loss=0.0997 tr_auc=0.5122 | val_auc=0.5875 val_f1=0.5810 thr=0.56 | 2.0s
+  [Fold 5 Ep 018] tr_loss=0.1011 tr_auc=0.5209 | val_auc=0.6313 val_f1=0.5492 thr=0.56 | 2.1s
+  *** New best AUC=0.6313 F1=0.5492 → saved
+  [Fold 5 Ep 019] tr_loss=0.1030 tr_auc=0.4910 | val_auc=0.6438 val_f1=0.5204 thr=0.56 | 2.1s
+  *** New best AUC=0.6438 F1=0.5204 → saved
+  [Fold 5 Ep 020] tr_loss=0.0939 tr_auc=0.5250 | val_auc=0.6125 val_f1=0.5902 thr=0.58 | 2.1s
+  [Fold 5 Ep 021] tr_loss=0.0894 tr_auc=0.5506 | val_auc=0.5938 val_f1=0.5508 thr=0.56 | 2.0s
+  [Fold 5 Ep 022] tr_loss=0.0928 tr_auc=0.5241 | val_auc=0.5813 val_f1=0.5130 thr=0.58 | 2.1s
+  [Fold 5 Ep 023] tr_loss=0.0974 tr_auc=0.4839 | val_auc=0.5938 val_f1=0.6190 thr=0.56 | 2.0s
+  [Fold 5 Ep 024] tr_loss=0.0903 tr_auc=0.5243 | val_auc=0.5875 val_f1=0.5366 thr=0.56 | 2.1s
+  [Fold 5 Ep 025] tr_loss=0.0898 tr_auc=0.5000 | val_auc=0.5938 val_f1=0.5354 thr=0.54 | 2.1s
+  [Fold 5 Ep 026] tr_loss=0.0881 tr_auc=0.5305 | val_auc=0.6125 val_f1=0.5902 thr=0.56 | 2.0s
+  [Fold 5 Ep 027] tr_loss=0.0956 tr_auc=0.4945 | val_auc=0.5813 val_f1=0.5238 thr=0.56 | 2.0s
+  [Fold 5 Ep 028] tr_loss=0.0855 tr_auc=0.5337 | val_auc=0.6000 val_f1=0.5619 thr=0.54 | 2.0s
+  [Fold 5 Ep 029] tr_loss=0.0865 tr_auc=0.5329 | val_auc=0.6000 val_f1=0.5625 thr=0.56 | 2.0s
+  [Fold 5 Ep 030] tr_loss=0.0944 tr_auc=0.4738 | val_auc=0.6250 val_f1=0.5204 thr=0.54 | 2.0s
+  [Fold 5 Ep 031] tr_loss=0.0871 tr_auc=0.5192 | val_auc=0.5687 val_f1=0.5130 thr=0.56 | 2.1s
+  [Fold 5 Ep 032] tr_loss=0.0828 tr_auc=0.5637 | val_auc=0.6313 val_f1=0.5619 thr=0.56 | 2.1s
+  [Fold 5 Ep 033] tr_loss=0.0882 tr_auc=0.5021 | val_auc=0.6625 val_f1=0.5048 thr=0.56 | 2.1s
+  *** New best AUC=0.6625 F1=0.5048 → saved
+  [Fold 5 Ep 034] tr_loss=0.0844 tr_auc=0.5273 | val_auc=0.6813 val_f1=0.5758 thr=0.56 | 2.2s
+  *** New best AUC=0.6813 F1=0.5758 → saved
+  [Fold 5 Ep 035] tr_loss=0.0819 tr_auc=0.5494 | val_auc=0.5875 val_f1=0.5906 thr=0.54 | 2.1s
+  [Fold 5 Ep 036] tr_loss=0.0832 tr_auc=0.5344 | val_auc=0.6250 val_f1=0.5906 thr=0.54 | 2.1s
+  [Fold 5 Ep 037] tr_loss=0.0876 tr_auc=0.4785 | val_auc=0.6250 val_f1=0.5902 thr=0.56 | 2.1s
+  [Fold 5 Ep 038] tr_loss=0.0791 tr_auc=0.5764 | val_auc=0.6000 val_f1=0.5088 thr=0.54 | 2.0s
+  [Fold 5 Ep 039] tr_loss=0.0810 tr_auc=0.5293 | val_auc=0.5813 val_f1=0.5130 thr=0.56 | 2.1s
+  [Fold 5 Ep 040] tr_loss=0.0822 tr_auc=0.5486 | val_auc=0.5563 val_f1=0.5130 thr=0.56 | 2.1s
+  [Fold 5 Ep 041] tr_loss=0.0814 tr_auc=0.5344 | val_auc=0.5938 val_f1=0.5333 thr=0.54 | 2.0s
+  [Fold 5 Ep 042] tr_loss=0.0770 tr_auc=0.5867 | val_auc=0.6313 val_f1=0.5906 thr=0.54 | 2.1s
+  [Fold 5 Ep 043] tr_loss=0.0826 tr_auc=0.5426 | val_auc=0.6188 val_f1=0.5492 thr=0.56 | 2.1s
+  [Fold 5 Ep 044] tr_loss=0.0776 tr_auc=0.5840 | val_auc=0.5875 val_f1=0.5758 thr=0.56 | 2.1s
+  [Fold 5 Ep 045] tr_loss=0.0800 tr_auc=0.5534 | val_auc=0.6188 val_f1=0.6040 thr=0.56 | 2.1s
+  [Fold 5 Ep 046] tr_loss=0.0830 tr_auc=0.5249 | val_auc=0.5875 val_f1=0.6040 thr=0.56 | 2.1s
+  [Fold 5 Ep 047] tr_loss=0.0774 tr_auc=0.5789 | val_auc=0.5813 val_f1=0.5758 thr=0.58 | 2.0s
+  [Fold 5 Ep 048] tr_loss=0.0794 tr_auc=0.5762 | val_auc=0.5812 val_f1=0.5492 thr=0.56 | 2.1s
+  [Fold 5 Ep 049] tr_loss=0.0784 tr_auc=0.5922 | val_auc=0.6125 val_f1=0.6040 thr=0.58 | 2.1s
+  [Fold 5 Ep 050] tr_loss=0.0811 tr_auc=0.5372 | val_auc=0.6062 val_f1=0.5508 thr=0.54 | 2.1s
+  [Fold 5 Ep 051] tr_loss=0.0781 tr_auc=0.5767 | val_auc=0.6250 val_f1=0.5758 thr=0.58 | 2.0s
+  [Fold 5 Ep 052] tr_loss=0.0748 tr_auc=0.6150 | val_auc=0.6062 val_f1=0.6190 thr=0.58 | 2.0s
+  [Fold 5 Ep 053] tr_loss=0.0805 tr_auc=0.5183 | val_auc=0.5938 val_f1=0.6040 thr=0.58 | 2.0s
+  [Fold 5 Ep 054] tr_loss=0.0752 tr_auc=0.5910 | val_auc=0.6188 val_f1=0.5902 thr=0.58 | 2.0s
+  [Fold 5 Ep 055] tr_loss=0.0757 tr_auc=0.5965 | val_auc=0.5875 val_f1=0.5902 thr=0.56 | 2.0s
+  [Fold 5 Ep 056] tr_loss=0.0784 tr_auc=0.5679 | val_auc=0.6000 val_f1=0.5902 thr=0.58 | 2.1s
+  [Fold 5 Ep 057] tr_loss=0.0774 tr_auc=0.5648 | val_auc=0.6125 val_f1=0.6190 thr=0.58 | 2.1s
+  [Fold 5 Ep 058] tr_loss=0.0762 tr_auc=0.5841 | val_auc=0.6188 val_f1=0.6199 thr=0.56 | 2.0s
+  [Fold 5 Ep 059] tr_loss=0.0743 tr_auc=0.6096 | val_auc=0.6125 val_f1=0.6500 thr=0.56 | 2.1s
+  [Fold 5 Ep 060] tr_loss=0.0713 tr_auc=0.6486 | val_auc=0.6000 val_f1=0.6500 thr=0.56 | 2.0s
+  [Fold 5 Ep 061] tr_loss=0.0741 tr_auc=0.6254 | val_auc=0.6250 val_f1=0.5619 thr=0.54 | 2.1s
+  [Fold 5 Ep 062] tr_loss=0.0692 tr_auc=0.6650 | val_auc=0.6000 val_f1=0.5906 thr=0.56 | 2.1s
+  [Fold 5 Ep 063] tr_loss=0.0705 tr_auc=0.6411 | val_auc=0.6312 val_f1=0.6190 thr=0.60 | 2.1s
+  [Fold 5 Ep 064] tr_loss=0.0698 tr_auc=0.6746 | val_auc=0.6187 val_f1=0.6199 thr=0.58 | 2.1s
+  [Fold 5 Ep 065] tr_loss=0.0747 tr_auc=0.6140 | val_auc=0.6125 val_f1=0.5906 thr=0.58 | 2.3s
+  [Fold 5 Ep 066] tr_loss=0.0753 tr_auc=0.6380 | val_auc=0.6187 val_f1=0.6500 thr=0.58 | 2.2s
+  [Fold 5 Ep 067] tr_loss=0.0720 tr_auc=0.6313 | val_auc=0.6125 val_f1=0.5902 thr=0.58 | 2.2s
+  [Fold 5 Ep 068] tr_loss=0.0744 tr_auc=0.6252 | val_auc=0.6187 val_f1=0.6500 thr=0.58 | 2.1s
+  [Fold 5 Ep 069] tr_loss=0.0739 tr_auc=0.6220 | val_auc=0.6125 val_f1=0.5902 thr=0.58 | 2.1s
+  [Fold 5 Ep 070] tr_loss=0.0706 tr_auc=0.6696 | val_auc=0.6000 val_f1=0.5619 thr=0.56 | 2.2s
+  [Fold 5 Ep 071] tr_loss=0.0720 tr_auc=0.6371 | val_auc=0.6125 val_f1=0.6813 thr=0.58 | 2.1s
+  [Fold 5 Ep 072] tr_loss=0.0719 tr_auc=0.6700 | val_auc=0.6125 val_f1=0.6813 thr=0.60 | 2.1s
+  [Fold 5 Ep 073] tr_loss=0.0692 tr_auc=0.6685 | val_auc=0.6125 val_f1=0.6813 thr=0.58 | 2.2s
+  [Fold 5 Ep 074] tr_loss=0.0760 tr_auc=0.6017 | val_auc=0.6062 val_f1=0.6813 thr=0.60 | 2.2s
+  Early stopping at epoch 74 (no_improve=40)
+
+  Fold 5 done: best_AUC=0.6813  best_F1=0.5758  epoch=34
+
+============================================================
+  CROSS-VALIDATION SUMMARY (5-Fold Stratified)
+============================================================
+
+    Fold |      AUC |   F1 Macro |  Best Ep
+  ------------------------------------------
+       1 |   0.6722 |     0.5797 |        8
+       2 |   0.6667 |     0.6037 |       43
+       3 |   0.8250 |     0.8095 |        4
+       4 |   0.7188 |     0.6571 |        9
+       5 |   0.6813 |     0.5758 |       34
+  ------------------------------------------
+    Mean |   0.7128 |     0.6452 |     19.6
+     Std |   0.0590 |     0.0872 |     15.8
+     Min |   0.6667 |     0.5758 |
+     Max |   0.8250 |     0.8095 |
+
+  >>> PAPER: AUC = 0.7128 ± 0.0590
+
+  Best fold for final evaluation: Fold 3 (AUC=0.8250)
+  Average best epoch: 20 → use as target for final model
+
+  Summary saved: C:\Users\Administrator\Desktop\thgnn\checkpoints_cv\cv_summary.json
+
+  Next step: run train_final.py to retrain on all 142 participants
+  and evaluate ONCE on test set (47 participants).
+(.venv) PS C:\Users\Administrator\Desktop\thgnn> python train.py --aug-sds --cv-summary checkpoints_cv/cv_summary.json      
+CV Summary loaded: AUC=0.7128 ± 0.0590  F1=0.6452 ± 0.0872
+Mean best epoch from CV: 19.6
+
+Target epochs: 20
+
+Loading train+dev participants (all 142 for final training) ...
+Loaded 142 participants (0 skipped)
+  Positive: 42  Negative: 100
+
+Loading test participants (held-out, evaluated ONCE) ...
+Test: 47 participants (14 pos, 33 neg)
+
+SDS: 142 → 426 samples
+
+Model params: 1,534,972
+Training for 20 epochs on 426 samples ...
+[Ep 001/20] loss=0.3885 train_auc=0.5146 lr=3.33e-05 | 3.2s
+[Ep 002/20] loss=0.2579 train_auc=0.4886 lr=5.00e-05 | 2.4s
+C:\Users\Administrator\Desktop\thgnn\.venv\lib\site-packages\torch\optim\lr_scheduler.py:232: UserWarning: The epoch parameter in `scheduler.step()` was not necessary and is being deprecated where possible. Please use `scheduler.step()` to step the scheduler. During the deprecation, if epoch is different from None, the closed form is used instead of the new chainable 
+form, where available. Please open an issue if you are unable to replicate your use case: https://github.com/pytorch/pytorch/issues/new/choose.
+  warnings.warn(EPOCH_DEPRECATION_WARNING, UserWarning)
+[Ep 003/20] loss=0.1889 train_auc=0.5147 lr=5.00e-05 | 2.4s
+[Ep 004/20] loss=0.1890 train_auc=0.4841 lr=4.97e-05 | 2.5s
+[Ep 005/20] loss=0.1460 train_auc=0.5153 lr=4.88e-05 | 2.4s
+[Ep 006/20] loss=0.1383 train_auc=0.5006 lr=4.73e-05 | 2.5s
+[Ep 007/20] loss=0.1439 train_auc=0.4662 lr=4.52e-05 | 2.5s
+[Ep 008/20] loss=0.1185 train_auc=0.5378 lr=4.27e-05 | 2.5s
+[Ep 009/20] loss=0.1214 train_auc=0.5057 lr=3.97e-05 | 2.5s
+[Ep 010/20] loss=0.1168 train_auc=0.4849 lr=3.64e-05 | 2.4s
+[Ep 011/20] loss=0.1088 train_auc=0.5004 lr=3.28e-05 | 2.5s
+[Ep 012/20] loss=0.0973 train_auc=0.5760 lr=2.90e-05 | 2.4s
+[Ep 013/20] loss=0.1051 train_auc=0.4850 lr=2.51e-05 | 2.6s
+[Ep 014/20] loss=0.0967 train_auc=0.5519 lr=2.11e-05 | 2.6s
+[Ep 015/20] loss=0.0946 train_auc=0.5342 lr=1.73e-05 | 2.5s
+[Ep 016/20] loss=0.0937 train_auc=0.5660 lr=1.37e-05 | 2.5s
+[Ep 017/20] loss=0.0989 train_auc=0.5195 lr=1.04e-05 | 2.6s
+[Ep 018/20] loss=0.0964 train_auc=0.5307 lr=7.41e-06 | 2.5s
+[Ep 019/20] loss=0.1016 train_auc=0.5034 lr=4.87e-06 | 2.7s
+[Ep 020/20] loss=0.0976 train_auc=0.5093 lr=2.82e-06 | 2.6s
+
+Final model saved: C:\Users\Administrator\Desktop\thgnn\checkpoints_final\final_model.pt
+
+Threshold from CV fold mean: 0.568
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  FINAL TEST EVALUATION — This number goes in the paper
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+=================================================================
+  FINAL TEST RESULTS  (threshold=0.57)
+=================================================================
+  AUC-ROC    : 0.6472
+  F1 (macro) : 0.4835
+  F1 (weighted): 0.5057
+  Precision  : 0.3214
+  Recall     : 0.6429
+  Accuracy   : 0.4894
+
+  Confusion Matrix:
+                 Pred Neg  Pred Pos
+    True Neg :       14        19
+    True Pos :        5         9
+
+               precision    recall  f1-score   support
+
+Not Depressed     0.7368    0.4242    0.5385        33
+    Depressed     0.3214    0.6429    0.4286        14
+
+     accuracy                         0.4894        47
+    macro avg     0.5291    0.5335    0.4835        47
+ weighted avg     0.6131    0.4894    0.5057        47
+
+=================================================================
+
+Final report saved: C:\Users\Administrator\Desktop\thgnn\checkpoints_final\final_report.json
+
+=================================================================
+  PAPER NUMBERS
+=================================================================
+  CV AUC (5-fold): 0.7128 ± 0.0590
+  CV F1  (5-fold): 0.6452 ± 0.0872
+  Test AUC : 0.6472
+  Test F1  : 0.4835
+  Test Prec: 0.3214
+  Test Rec : 0.6429
+  Test Acc : 0.4894
+=================================================================
+(.venv) PS C:\Users\Administrator\Desktop\thgnn> 

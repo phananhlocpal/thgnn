@@ -444,9 +444,9 @@ if __name__ == "__main__":
 
     loss, ld = compute_loss(
         dep_logit, sym_logits, phq_pred,
-        batch.y.squeeze().float(),
+        batch.y.reshape(-1).float(),
         torch.stack([d.phq8 for d in graphs]),
-        batch.phq_score.squeeze(),
+        batch.phq_score.reshape(-1),
     )
     print(f"loss: {loss.item():.4f}  {ld}")
     print("Smoke-test PASSED.")

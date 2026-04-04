@@ -1,213 +1,249 @@
 """
-train.py v2 — Training script cho HMSGNet v2.
-Xem docstring đầy đủ trong file gốc.
+train_final.py — Final model training sau khi có CV results.
+
+Mục đích
+────────
+Sau khi train_cv.py cho ra mean_epoch (số epoch tốt nhất trung bình qua 5 folds),
+script này:
+  1. Retrain HMSGNet trên TOÀN BỘ train+dev (142 participants) với SDS
+  2. Train đúng mean_epoch epochs (không có early stopping — đã biết target)
+  3. Evaluate MỘT LẦN DUY NHẤT trên test set (47 participants)
+  4. Report final paper metrics
+
+Usage
+─────
+    python train_final.py --target-epoch 60 --aug-sds
+    python train_final.py --cv-summary checkpoints_cv/cv_summary.json --aug-sds
+
+Lưu ý quan trọng
+─────────────────
+Test set (47 participants) KHÔNG ĐƯỢC NHÌN trong suốt quá trình CV.
+Đây là single final evaluation — đúng scientific practice.
 """
 
-import argparse, math, os, random, time
+import argparse
+import json
+import os
+import random
+import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.metrics import (accuracy_score, f1_score, precision_score,
+from sklearn.metrics import (accuracy_score, classification_report,
+                              confusion_matrix, f1_score, precision_score,
                               recall_score, roc_auc_score)
+from sklearn.model_selection import StratifiedKFold
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
+from torch.utils.data import WeightedRandomSampler
+from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
-from daicwoz_dataset import DaicWozDataset
+from daicwoz_dataset import (DaicWozDataset, build_graph, apply_sds,
+                               DAICWOZ_DATA_DIR)
 from model import HMSGNet, compute_loss
+from train_cv import (
+    load_all_participants, FoldDataset, run_epoch,
+    find_best_threshold, compute_metrics, build_scheduler,
+    set_seed, CV_CFG, SPLIT_FILES, NUM_SYMPTOMS, MAX_GRAD_NORM, DEVICE,
+    PHQ8_COLS,
+)
 
-try:
-    from edaic_dataset import DepressionDataset
-    HAS_EDAIC = True
-except ImportError:
-    HAS_EDAIC = False
+# ─────────────────────────────────────────────────────────────────────────────
+# Paths
+# ─────────────────────────────────────────────────────────────────────────────
 
-SEED = 42
+BASE_DIR  = Path("C:/Users/Administrator/Desktop/thgnn")
+CKPT_DIR  = BASE_DIR / "checkpoints_final"
 
-DATASET_CFG: Dict[str, dict] = {
-    "edaic": {
-        "cache_dir":      "C:/Users/Administrator/Desktop/thgnn/cache",
-        "checkpoint_dir": Path("C:/Users/Administrator/Desktop/thgnn/checkpoints"),
-        "text_dim": 777, "audio_dim": 777,
-        "hidden_dim": 256, "num_gnn_layers": 3, "num_edge_types": 6,
-        "n_heads": 4, "dropout": 0.35, "drop_edge": 0.20, "feat_noise": 0.02,
-        "focal_alpha": 0.80, "label_smoothing": 0.0,
-        "w_symptom": 0.3, "w_phq": 0.1,
-        "aug_sds": False, "aug_copies": 0, "aug_prob": 0.8,
-        "lr": 3e-4, "weight_decay": 2e-4,
-        "warmup_epochs": 5, "cosine_epochs": 250, "eta_min": 1e-6,
-        "batch_size": 8, "max_epochs": 250, "early_stop_pat": 30,
-        "use_weighted_sampler": False,
-    },
-    "daicwoz": {
-        "cache_dir":      "C:/Users/Administrator/Desktop/thgnn/cache_daicwoz",
-        "checkpoint_dir": Path("C:/Users/Administrator/Desktop/thgnn/checkpoints_daicwoz"),
-        # 768 BERT + 9 acoustic | 768 WavLM + 9 acoustic
-        "text_dim": 777, "audio_dim": 777,
-        # Upscaled nhờ SDS: 107 → ~321 training samples
-        "hidden_dim": 128, "num_gnn_layers": 2, "num_edge_types": 6,
-        "n_heads": 4, "dropout": 0.60, "drop_edge": 0.20, "feat_noise": 0.05,
-        "focal_alpha": 0.75, "label_smoothing": 0.05,
-        "w_symptom": 0.20, "w_phq": 0.05,
-        # SDS: 107 * (1 + 2) = 321 effective training samples
-        "aug_sds": True, "aug_copies": 2, "aug_prob": 0.80,
-        "lr": 1e-4, "weight_decay": 5e-3,
-        "warmup_epochs": 2, "cosine_epochs": 400, "eta_min": 1e-7,
-        "batch_size": 8, "max_epochs": 400, "early_stop_pat": 80,
-        "use_weighted_sampler": True,
-    },
-}
-
-NUM_SYMPTOMS  = 8
-MAX_GRAD_NORM = 1.0
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.backends.cudnn.allow_tf32       = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.benchmark        = True
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark     = False
+# ─────────────────────────────────────────────────────────────────────────────
+# Load test participants
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_test_participants():
+    df = pd.read_csv(SPLIT_FILES["test"])
+    df.columns = df.columns.str.strip()
+    label_col = "PHQ8_Binary" if "PHQ8_Binary" in df.columns else "PHQ_Binary"
+    score_col = "PHQ8_Score"  if "PHQ8_Score"  in df.columns else "PHQ_Score"
+
+    phq8_dict = {}
+    if all(c in df.columns for c in PHQ8_COLS):
+        for _, row in df.iterrows():
+            vals = row[PHQ8_COLS].values.astype(np.float32)
+            vals = np.where(np.isnan(vals), 0.0, vals)
+            phq8_dict[int(row["Participant_ID"])] = vals
+
+    graphs, pids, labels = [], [], []
+    for _, row in df.iterrows():
+        pid       = int(row["Participant_ID"])
+        label     = int(row[label_col])
+        phq_score = float(row.get(score_col, 0.0))
+        phq8      = phq8_dict.get(pid, np.zeros(8, dtype=np.float32))
+
+        missing = any(
+            not (DAICWOZ_DATA_DIR / f"{pid}_{m}_feats.npy").exists()
+            for m in ("text", "audio")
+        )
+        if missing:
+            print(f"  [SKIP] PID {pid}: missing features")
+            continue
+        try:
+            g = build_graph(pid, label, phq_score, phq8)
+            if g is not None:
+                graphs.append(g); pids.append(pid); labels.append(label)
+        except Exception as e:
+            print(f"  [SKIP] PID {pid}: {e}")
+
+    print(f"Test: {len(graphs)} participants "
+          f"({sum(labels)} pos, {len(labels)-sum(labels)} neg)")
+    return graphs, pids, labels
 
 
-def find_best_threshold(labels: np.ndarray, probs: np.ndarray) -> float:
-    best_thr, best_f1 = 0.5, 0.0
-    for thr in np.arange(0.20, 0.81, 0.02):
-        preds = (probs >= thr).astype(int)
-        f1    = f1_score(labels, preds, average="macro", zero_division=0)
-        if f1 > best_f1:
-            best_f1, best_thr = f1, float(thr)
-    return best_thr
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluate on test set
+# ─────────────────────────────────────────────────────────────────────────────
 
+def evaluate_test(model, test_loader, threshold):
+    model.eval()
+    all_labels, all_probs = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            batch = batch.to(DEVICE)
+            dep_logit, _, _ = model(batch)
+            all_probs.extend(torch.sigmoid(dep_logit).cpu().numpy().tolist())
+            all_labels.extend(batch.y.reshape(-1).cpu().numpy().tolist())
 
-def compute_metrics(labels, probs, threshold=0.5):
-    preds = (probs >= threshold).astype(int)
-    m = {
-        "accuracy":    accuracy_score(labels, preds),
-        "f1_macro":    f1_score(labels, preds, average="macro",    zero_division=0),
-        "f1_weighted": f1_score(labels, preds, average="weighted", zero_division=0),
-        "precision":   precision_score(labels, preds, zero_division=0),
-        "recall":      recall_score(labels, preds, zero_division=0),
-        "threshold":   threshold,
+    labels = np.array(all_labels, int)
+    probs  = np.array(all_probs, float)
+    preds  = (probs >= threshold).astype(int)
+
+    try:    auc = roc_auc_score(labels, probs)
+    except: auc = float("nan")
+
+    f1_mac = f1_score(labels, preds, average="macro",    zero_division=0)
+    f1_wei = f1_score(labels, preds, average="weighted", zero_division=0)
+    prec   = precision_score(labels, preds, zero_division=0)
+    rec    = recall_score(labels, preds, zero_division=0)
+    acc    = accuracy_score(labels, preds)
+    cm     = confusion_matrix(labels, preds)
+
+    sep = "="*65
+    print(f"\n{sep}")
+    print(f"  FINAL TEST RESULTS  (threshold={threshold:.2f})")
+    print(sep)
+    print(f"  AUC-ROC    : {auc:.4f}")
+    print(f"  F1 (macro) : {f1_mac:.4f}")
+    print(f"  F1 (weighted): {f1_wei:.4f}")
+    print(f"  Precision  : {prec:.4f}")
+    print(f"  Recall     : {rec:.4f}")
+    print(f"  Accuracy   : {acc:.4f}")
+    print()
+    print("  Confusion Matrix:")
+    print(f"    {'':12} Pred Neg  Pred Pos")
+    print(f"    True Neg : {cm[0][0]:8d}  {cm[0][1]:8d}")
+    print(f"    True Pos : {cm[1][0]:8d}  {cm[1][1]:8d}")
+    print()
+    print(classification_report(
+        labels, preds,
+        target_names=["Not Depressed", "Depressed"],
+        digits=4, zero_division=0,
+    ))
+    print(sep)
+
+    return {
+        "auc": auc, "f1_macro": f1_mac, "f1_weighted": f1_wei,
+        "precision": prec, "recall": rec, "accuracy": acc,
+        "threshold": threshold,
+        "confusion_matrix": cm.tolist(),
     }
-    try:    m["auc"] = roc_auc_score(labels, probs)
-    except: m["auc"] = float("nan")
-    return m
 
 
-def run_epoch(model, loader, optimizer, device, is_train,
-              w_symptom=0.3, w_phq=0.1, focal_alpha=0.80, label_smoothing=0.0):
-    model.train() if is_train else model.eval()
-    totals = {k: 0.0 for k in ("loss_total","loss_dep","loss_symptom","loss_phq")}
-    n, all_labels, all_probs = 0, [], []
-    ctx = torch.enable_grad() if is_train else torch.no_grad()
-    with ctx:
-        for batch in loader:
-            batch = batch.to(device)
-            dep_logit, sym_logits, phq_pred = model(batch)
-            dep_labels  = batch.y.squeeze().long()
-            phq8_labels = batch.phq8.view(-1, NUM_SYMPTOMS).float()
-            phq_scores  = batch.phq_score.squeeze().float()
-            loss, ld = compute_loss(dep_logit, sym_logits, phq_pred,
-                                    dep_labels.float(), phq8_labels, phq_scores,
-                                    w_symptom=w_symptom, w_phq=w_phq,
-                                    focal_alpha=focal_alpha,
-                                    label_smoothing=label_smoothing, device=device)
-            if is_train:
-                optimizer.zero_grad(); loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
-                optimizer.step()
-            for k in totals: totals[k] += ld.get(k, 0.0)
-            n += 1
-            all_probs.extend(torch.sigmoid(dep_logit).detach().cpu().numpy().tolist())
-            all_labels.extend(dep_labels.detach().cpu().numpy().tolist())
-    if n > 0:
-        for k in totals: totals[k] /= n
-    return totals, np.array(all_labels, int), np.array(all_probs, float)
-
-
-def build_scheduler(optimizer, warmup_epochs, cosine_epochs, eta_min=1e-6):
-    def wfn(e): return float(e+1)/max(1,warmup_epochs) if e < warmup_epochs else 1.0
-    return SequentialLR(optimizer,
-        schedulers=[LambdaLR(optimizer, wfn),
-                    CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=eta_min)],
-        milestones=[warmup_epochs])
-
-
-def log_epoch(epoch, phase, losses, metrics, lr, elapsed):
-    print(f"[Epoch {epoch:03d}] {phase:5s} | "
-          f"loss={losses['loss_total']:.4f} (dep={losses['loss_dep']:.4f} "
-          f"sym={losses['loss_symptom']:.4f} phq={losses['loss_phq']:.4f}) | "
-          f"acc={metrics.get('accuracy',0):.4f} "
-          f"f1_macro={metrics.get('f1_macro',0):.4f} "
-          f"prec={metrics.get('precision',0):.4f} "
-          f"rec={metrics.get('recall',0):.4f} "
-          f"auc={metrics.get('auc',float('nan')):.4f} "
-          f"thr={metrics.get('threshold',0.5):.2f} | "
-          f"lr={lr:.2e} | {elapsed:.1f}s")
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset",      choices=["edaic","daicwoz"], default="edaic")
-    parser.add_argument("--force-reload", action="store_true")
+    parser = argparse.ArgumentParser(
+        description="Final model training + test evaluation for HMSGNet"
+    )
+    parser.add_argument("--target-epoch", type=int, default=None,
+                        help="Number of epochs to train (from CV mean_epoch)")
+    parser.add_argument("--cv-summary",   type=str, default=None,
+                        help="Path to cv_summary.json from train_cv.py")
     parser.add_argument("--aug-sds",      action="store_true")
-    parser.add_argument("--no-aug-sds",   action="store_true")
+    parser.add_argument("--seed",         type=int, default=42)
     args = parser.parse_args()
 
-    cfg = dict(DATASET_CFG[args.dataset])
-    if args.aug_sds:    cfg["aug_sds"] = True
-    if args.no_aug_sds: cfg["aug_sds"] = False
+    # Get target epoch from CV summary or CLI
+    target_epoch = args.target_epoch
+    cv_results   = None
 
-    ckpt_dir = cfg["checkpoint_dir"]
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    best_path = ckpt_dir / "best_model.pt"
+    if args.cv_summary and Path(args.cv_summary).exists():
+        with open(args.cv_summary) as f:
+            cv_results = json.load(f)
+        if target_epoch is None:
+            target_epoch = int(round(cv_results["mean_epoch"]))
+        print(f"CV Summary loaded: AUC={cv_results['paper_auc']}  F1={cv_results['paper_f1']}")
+        print(f"Mean best epoch from CV: {cv_results['mean_epoch']:.1f}")
 
-    set_seed(SEED)
-    print(f"Dataset: {args.dataset}  Device: {DEVICE}  SDS: {cfg['aug_sds']}")
+    if target_epoch is None:
+        target_epoch = 80  # safe default
+        print(f"No CV summary provided. Using default target_epoch={target_epoch}")
 
-    # ── Datasets ──────────────────────────────────────────────────────────────
-    if args.dataset == "edaic":
-        if not HAS_EDAIC: raise ImportError("edaic_dataset.py not found")
-        train_ds = DepressionDataset(split="train", root=cfg["cache_dir"],
-                                     force_reload=args.force_reload)
-        dev_ds   = DepressionDataset(split="dev",   root=cfg["cache_dir"],
-                                     force_reload=args.force_reload)
+    print(f"\nTarget epochs: {target_epoch}")
+
+    set_seed(args.seed)
+    CKPT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── Load ALL train+dev ─────────────────────────────────────────────────
+    print("\nLoading train+dev participants (all 142 for final training) ...")
+    all_graphs, all_pids, all_labels = load_all_participants(["train", "dev"])
+
+    # ── Load test (held-out, never seen during training) ───────────────────
+    print("\nLoading test participants (held-out, evaluated ONCE) ...")
+    test_graphs, test_pids, test_labels = load_test_participants()
+
+    # ── SDS augmentation ──────────────────────────────────────────────────
+    cfg = dict(CV_CFG)
+    if args.aug_sds:
+        augmented = []
+        for g in all_graphs:
+            augmented.append(g)
+            for _ in range(cfg["aug_copies"]):
+                aug = apply_sds(g, aug_prob=cfg["aug_prob"])
+                augmented.append(aug)
+        train_graphs_final = augmented
+        print(f"\nSDS: {len(all_graphs)} → {len(train_graphs_final)} samples")
     else:
-        train_ds = DaicWozDataset(split="train", root=cfg["cache_dir"],
-                                  force_reload=args.force_reload,
-                                  aug_sds=cfg["aug_sds"],
-                                  aug_copies=cfg.get("aug_copies", 2),
-                                  aug_prob=cfg.get("aug_prob", 0.80))
-        dev_ds   = DaicWozDataset(split="dev",   root=cfg["cache_dir"],
-                                  force_reload=args.force_reload, aug_sds=False)
+        train_graphs_final = all_graphs
+        print(f"\nNo SDS: {len(train_graphs_final)} samples")
 
-    # ── Loaders ───────────────────────────────────────────────────────────────
-    if cfg.get("use_weighted_sampler", False):
-        from torch.utils.data import WeightedRandomSampler
-        la = train_ds.labels().numpy()
-        cc = np.bincount(la)
-        sw = (1.0 / cc)[la]
-        sampler     = WeightedRandomSampler(torch.from_numpy(sw).float(),
-                                            len(train_ds), replacement=True)
-        train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"],
-                                  sampler=sampler, num_workers=0,
-                                  pin_memory=(DEVICE.type=="cuda"))
-    else:
-        train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"],
-                                  shuffle=True, num_workers=0,
-                                  pin_memory=(DEVICE.type=="cuda"))
-    dev_loader = DataLoader(dev_ds, batch_size=cfg["batch_size"],
-                            shuffle=False, num_workers=0,
-                            pin_memory=(DEVICE.type=="cuda"))
+    train_ds = FoldDataset(train_graphs_final)
+    test_ds  = FoldDataset(test_graphs)
 
-    lc = torch.bincount(train_ds.labels())
-    print(f"  Train: {len(train_ds)} (neg={lc[0]}, pos={lc[1]})  Dev: {len(dev_ds)}")
+    # Weighted sampler for imbalance
+    la = train_ds.labels().numpy()
+    lc = np.bincount(la)
+    sw = (1.0 / lc)[la]
+    sampler = WeightedRandomSampler(torch.from_numpy(sw).float(), len(train_ds), replacement=True)
 
-    # ── Model ─────────────────────────────────────────────────────────────────
+    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"],
+                              sampler=sampler, num_workers=0,
+                              pin_memory=(DEVICE.type=="cuda"))
+    test_loader  = DataLoader(test_ds,  batch_size=cfg["batch_size"],
+                              shuffle=False, num_workers=0,
+                              pin_memory=(DEVICE.type=="cuda"))
+
+    # ── Model ────────────────────────────────────────────────────────────
     model = HMSGNet(
         hidden_dim=cfg["hidden_dim"], num_gnn_layers=cfg["num_gnn_layers"],
         num_edge_types=cfg["num_edge_types"], num_symptoms=NUM_SYMPTOMS,
@@ -217,69 +253,92 @@ def main():
     ).to(DEVICE)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Params: {n_params:,}  hidden={cfg['hidden_dim']} "
-          f"layers={cfg['num_gnn_layers']} edges={cfg['num_edge_types']} "
-          f"dropout={cfg['dropout']} lr={cfg['lr']:.1e}")
+    print(f"\nModel params: {n_params:,}")
+    print(f"Training for {target_epoch} epochs on {len(train_ds)} samples ...")
 
     optimizer = AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
-    scheduler = build_scheduler(optimizer, cfg["warmup_epochs"],
-                                 cfg["cosine_epochs"], cfg["eta_min"])
+    # Use target_epoch as cosine period
+    scheduler = build_scheduler(optimizer, cfg["warmup_epochs"], target_epoch, cfg["eta_min"])
 
-    start_epoch, best_metric = 1, 0.0
-    if best_path.exists() and not args.force_reload:
-        ckpt = torch.load(str(best_path), map_location=DEVICE)
-        model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        start_epoch  = ckpt.get("epoch", 0) + 1
-        best_metric  = ckpt.get("best_metric", ckpt.get("best_auc", 0.0))
-        print(f"  Resumed from epoch {start_epoch-1}, best_metric={best_metric:.4f}")
+    ckpt_path = CKPT_DIR / "final_model.pt"
 
-    no_improve = 0
-
-    for epoch in range(start_epoch, cfg["max_epochs"] + 1):
+    for epoch in range(1, target_epoch + 1):
         t0 = time.time()
-        tl, tlab, tprob = run_epoch(model, train_loader, optimizer, DEVICE, True,
-                                     cfg["w_symptom"], cfg["w_phq"],
-                                     cfg["focal_alpha"], cfg.get("label_smoothing",0.0))
-        log_epoch(epoch, "TRAIN", tl, compute_metrics(tlab, tprob),
-                  optimizer.param_groups[0]["lr"], time.time()-t0)
-
-        t1 = time.time()
-        dl, dlab, dprob = run_epoch(model, dev_loader, None, DEVICE, False,
-                                     cfg["w_symptom"], cfg["w_phq"],
-                                     cfg["focal_alpha"], 0.0)
-        bthr  = find_best_threshold(dlab, dprob)
-        dmets = compute_metrics(dlab, dprob, threshold=bthr)
-        log_epoch(epoch, "DEV", dl, dmets, optimizer.param_groups[0]["lr"],
-                  time.time()-t1)
-
+        tl, tlab, tprob = run_epoch(model, train_loader, optimizer, DEVICE, True, cfg)
         scheduler.step()
+        tmets = compute_metrics(tlab, tprob)
+        print(f"[Ep {epoch:03d}/{target_epoch}] "
+              f"loss={tl['loss_dep']:.4f} train_auc={tmets['auc']:.4f} "
+              f"lr={optimizer.param_groups[0]['lr']:.2e} "
+              f"| {time.time()-t0:.1f}s")
 
-        dev_auc = dmets.get("auc", 0.0)
-        dev_f1  = dmets.get("f1_macro", 0.0)
+    # Save final model
+    torch.save({
+        "epoch": target_epoch,
+        "model_state_dict": model.state_dict(),
+        "config": cfg,
+        "cv_results": cv_results,
+    }, str(ckpt_path))
+    print(f"\nFinal model saved: {ckpt_path}")
 
-        if dev_auc > best_metric:
-            best_metric = dev_auc
-            no_improve  = 0
-            torch.save({
-                "epoch": epoch, "best_metric": best_metric, "best_f1": dev_f1,
-                "best_threshold": bthr, "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-            }, str(best_path))
-            print(f"  * New best AUC={best_metric:.4f} (F1={dev_f1:.4f} thr={bthr:.2f}) → saved")
-        else:
-            no_improve += 1
-            print(f"  No improvement ({no_improve}/{cfg['early_stop_pat']}). Best={best_metric:.4f}")
-            if no_improve >= cfg["early_stop_pat"]:
-                print(f"Early stopping at epoch {epoch}.")
-                break
+    # ── Find threshold on training set (no dev leakage) ──────────────────
+    # Use training predictions to find threshold (common practice)
+    # Alternatively: use mean threshold from CV folds
+    if cv_results and "folds" in cv_results:
+        thrs = [f["best_thr"] for f in cv_results["folds"]]
+        threshold = float(np.mean(thrs))
+        print(f"\nThreshold from CV fold mean: {threshold:.3f}")
+    else:
+        # Fallback: find on train set
+        _, tlab_final, tprob_final = run_epoch(
+            model, train_loader, None, DEVICE, False, cfg
+        )
+        threshold = find_best_threshold(tlab_final, tprob_final)
+        print(f"\nThreshold from train set: {threshold:.3f}")
 
-    print(f"\nDone. Best dev AUC = {best_metric:.4f}")
-    print(f"Best model: {best_path}")
+    # ── FINAL TEST EVALUATION (một lần duy nhất) ─────────────────────────
+    print("\n" + "!"*65)
+    print("  FINAL TEST EVALUATION — This number goes in the paper")
+    print("!"*65)
+
+    test_results = evaluate_test(model, test_loader, threshold)
+
+    # ── Save results ─────────────────────────────────────────────────────
+    final_report = {
+        "target_epoch":  target_epoch,
+        "aug_sds":       args.aug_sds,
+        "seed":          args.seed,
+        "n_train":       len(all_graphs),
+        "n_train_aug":   len(train_graphs_final),
+        "n_test":        len(test_graphs),
+        "threshold":     threshold,
+        "cv_summary":    {
+            "mean_auc": cv_results.get("mean_auc") if cv_results else None,
+            "std_auc":  cv_results.get("std_auc")  if cv_results else None,
+            "mean_f1":  cv_results.get("mean_f1")  if cv_results else None,
+            "std_f1":   cv_results.get("std_f1")   if cv_results else None,
+        },
+        "test_results":  test_results,
+    }
+
+    report_path = CKPT_DIR / "final_report.json"
+    with open(str(report_path), "w") as f:
+        json.dump(final_report, f, indent=2, default=str)
+
+    print(f"\nFinal report saved: {report_path}")
+    print()
+    print("=" * 65)
+    print("  PAPER NUMBERS")
+    print("=" * 65)
+    if cv_results:
+        print(f"  CV AUC (5-fold): {cv_results.get('paper_auc', 'N/A')}")
+        print(f"  CV F1  (5-fold): {cv_results.get('paper_f1',  'N/A')}")
+    print(f"  Test AUC : {test_results['auc']:.4f}")
+    print(f"  Test F1  : {test_results['f1_macro']:.4f}")
+    print(f"  Test Prec: {test_results['precision']:.4f}")
+    print(f"  Test Rec : {test_results['recall']:.4f}")
+    print(f"  Test Acc : {test_results['accuracy']:.4f}")
+    print("=" * 65)
 
 
 if __name__ == "__main__":
