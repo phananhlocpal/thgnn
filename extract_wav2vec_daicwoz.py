@@ -75,7 +75,6 @@ WAVLM_LAYER_END      = 12   # exclusive → layers [6,7,8,9,10,11]
 # Adaptive VAD
 VAD_FRAME_SEC        = 0.02
 VAD_NOISE_MULTIPLIER = 3.0   # threshold = noise_floor * 3.0
-VAD_NOISE_PREFIX_SEC = 0.5   # use first 0.5s to estimate noise floor
 MIN_SPEECH_RATIO     = 0.10  # below this → skip embedding (silence segment)
 MIN_PAUSE_DUR_SEC    = 0.15  # pauses shorter than this ignored
 
@@ -117,18 +116,31 @@ def slice_segment(
 
 def estimate_noise_floor(waveform: torch.Tensor) -> float:
     """
-    Estimate noise floor from the first VAD_NOISE_PREFIX_SEC of the segment.
-    Uses RMS energy of the prefix as noise floor estimate.
-    Falls back to a fixed low value if prefix is too short.
-    """
-    n_prefix = int(VAD_NOISE_PREFIX_SEC * TARGET_SR)
-    if len(waveform) < n_prefix or n_prefix < 160:
-        return 0.005   # fallback
+    Estimate noise floor using the p5 of 1-second window RMS distribution.
 
-    prefix = waveform[:n_prefix].numpy()
-    rms    = float(np.sqrt(np.mean(prefix ** 2)))
-    # Clip to avoid pathological cases
-    return float(np.clip(rms, 1e-5, 0.1))
+    BUG FIX (critical): the previous implementation used the first 0.5s of
+    the recording as the noise floor estimate. In DAIC-WOZ, Ellie (the
+    interviewer) speaks FIRST — so the prefix is Ellie's voice, not silence.
+    For PID 310, this caused a 40x overestimate of the noise floor
+    (0.0196 vs true ~0.0005), setting VAD threshold so high that 100% of
+    participant speech frames were classified as silence → all zeros.
+
+    Fix: use the 5th percentile of 1s-window RMS values across the full
+    recording. The quietest 5% of 1s windows reliably capture true silence
+    regardless of who speaks at the beginning.
+    """
+    wav     = waveform.numpy()
+    win_len = TARGET_SR  # 1 second windows
+    n_wins  = max(1, len(wav) // win_len)
+
+    win_rms = np.array([
+        float(np.sqrt(np.mean(wav[i * win_len:(i + 1) * win_len] ** 2)))
+        for i in range(n_wins)
+    ])
+
+    # p5 of window RMS = a robust estimate of the recording noise floor
+    noise_floor = float(np.percentile(win_rms, 5))
+    return float(np.clip(noise_floor, 1e-6, 0.05))
 
 
 def compute_silence_features(

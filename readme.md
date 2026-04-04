@@ -1,7 +1,7 @@
 # Bước 1: Extract BERT cả 3 context modes
-python extract_bert_daicwoz.py --split_csv daicwoz/train_split_Depression_AVEC2017.csv --all_modes
-python extract_bert_daicwoz.py --split_csv daicwoz/dev_split_Depression_AVEC2017.csv --all_modes
-python extract_bert_daicwoz.py --split_csv daicwoz/test_split_Depression_AVEC2017.csv --all_modes
+python extract_bert_daicwoz.py --split_csv daicwoz/train_split_Depression_AVEC2017.csv 
+python extract_bert_daicwoz.py --split_csv daicwoz/dev_split_Depression_AVEC2017.csv 
+python extract_bert_daicwoz.py --split_csv daicwoz/test_split_Depression_AVEC2017.csv 
 
 python extract_wav2vec_daicwoz.py --split_csv daicwoz/train_split_Depression_AVEC2017.csv --fp16 --batch_size 32
 python extract_wav2vec_daicwoz.py --split_csv daicwoz/dev_split_Depression_AVEC2017.csv --fp16 --batch_size 32
